@@ -193,7 +193,8 @@ class VivadoBackend(FPGABackend):
 
         templates = self._get_layer_templates()
         template_flow = register_flow('apply_templates', self._get_layer_templates, requires=[init_flow], backend=self.name)
-        trainable_flow = register_flow('trainable', None, requires=[template_flow], backend=self.name)
+        trainable_passes = ['vivado:validate_trainable_config']
+        trainable_flow = register_flow('trainable', trainable_passes, requires=[template_flow], backend=self.name)
 
         writer_passes = ['make_stamp', 'vivado:write_hls']
         self._writer_flow = register_flow('write', writer_passes, requires=['vivado:ip'], backend=self.name)
@@ -217,6 +218,7 @@ class VivadoBackend(FPGABackend):
             + optimization_passes
             + vivado_types
             + templates
+            + trainable_passes
             + writer_passes
             + fifo_depth_opt_passes
         ]

@@ -1,8 +1,24 @@
 import numpy as np
+import pytest
 
 from hls4ml.backends import get_backend
 from hls4ml.model.flow import get_flow
 from hls4ml.model.graph import HLSConfig, ModelGraph
+from hls4ml.model.optimizer import get_optimizer
+
+
+TRAINABLE_PRECISION = {
+    'grad_in': 'ap_fixed<18,8>',
+    'grad_out': 'ap_fixed<18,8>',
+    'weight_grad': 'ap_fixed<20,8>',
+    'bias_grad': 'ap_fixed<20,8>',
+    'gradient_accum': 'ap_fixed<28,14>',
+    'raw_update': 'ap_fixed<20,6>',
+    'update': 'ap_fixed<20,6>',
+    'optimizer_state': 'ap_fixed<20,6>',
+    'controller_metric': 'ap_fixed<32,16>',
+    'alpha': 'ap_fixed<16,4>',
+}
 
 
 def make_config(training=None, layer_training=None):
@@ -194,4 +210,64 @@ def test_vivado_trainable_flow_is_registered_before_writer():
     ip_flow = get_flow(backend.get_default_flow())
 
     assert trainable_flow.requires == ['vivado:apply_templates']
+    assert trainable_flow.optimizers == ['vivado:validate_trainable_config']
     assert 'vivado:trainable' in ip_flow.requires
+
+
+def test_vivado_trainable_validation_accepts_supported_dense_graph():
+    layers = [
+        {'class_name': 'Input', 'name': 'input_layer', 'input_shape': [1]},
+        {
+            'class_name': 'Dense',
+            'name': 'dense',
+            'n_in': 1,
+            'n_out': 1,
+            'weight_data': np.array([[1.0]]),
+            'bias_data': np.array([0.0]),
+        },
+    ]
+    config = make_config(
+        {
+            'Trainable': True,
+            'Loss': {'Kind': 'half_mse'},
+            'Optimizer': {'Kind': 'sgd', 'LearningRate': 0.01},
+            'Controller': {'Kind': 'CTRL-GT-ORDER-0'},
+            'Precision': TRAINABLE_PRECISION,
+        }
+    )
+    config['HLSConfig']['LayerName'] = {'input_layer': {'Training': {'Trainable': False}}}
+    config['HLSConfig']['Flows'] = []
+    model = ModelGraph.from_layer_list(config, layers)
+
+    validate_trainable_config = get_optimizer('vivado:validate_trainable_config')
+
+    assert validate_trainable_config.transform(model) is False
+
+
+def test_vivado_trainable_validation_rejects_missing_loss():
+    layers = [
+        {'class_name': 'Input', 'name': 'input_layer', 'input_shape': [1]},
+        {
+            'class_name': 'Dense',
+            'name': 'dense',
+            'n_in': 1,
+            'n_out': 1,
+            'weight_data': np.array([[1.0]]),
+            'bias_data': np.array([0.0]),
+        },
+    ]
+    config = make_config(
+        {
+            'Trainable': True,
+            'Optimizer': {'LearningRate': 0.01},
+            'Precision': TRAINABLE_PRECISION,
+        }
+    )
+    config['HLSConfig']['LayerName'] = {'input_layer': {'Training': {'Trainable': False}}}
+    config['HLSConfig']['Flows'] = []
+    model = ModelGraph.from_layer_list(config, layers)
+
+    validate_trainable_config = get_optimizer('vivado:validate_trainable_config')
+
+    with pytest.raises(Exception, match='supports losses'):
+        validate_trainable_config.transform(model)
