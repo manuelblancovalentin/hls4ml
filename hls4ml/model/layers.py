@@ -126,6 +126,7 @@ class Layer(Serializable):
                     )
                 self.attributes[config_key] = config_value
 
+            self._set_trainable_attributes()
             self.initialize()
             self._validate_attributes()
         else:
@@ -203,6 +204,21 @@ class Layer(Serializable):
         if has_type_t:
             type_t = NamedType(*reversed(self.model.config.get_precision(self, name)))
             self.set_attr(name + '_t', type_t)
+
+    def _set_trainable_attributes(self):
+        trainable_config = self.model.config.get_layer_trainable_config(self)
+        trainable = bool(trainable_config.get('Trainable', False))
+        self.set_attr('trainable', trainable)
+
+        if not trainable:
+            return
+
+        precision_config = self.model.config.get_layer_trainable_precision_config(self)
+        for field in self.model.config.get_trainable_precision_fields():
+            if field not in precision_config:
+                continue
+            precision, type_name = self.model.config.get_trainable_precision(self, field)
+            self.set_attr(field + '_t', NamedType(type_name, precision))
 
     def get_input_node(self, input_name=None):
         if input_name is None:

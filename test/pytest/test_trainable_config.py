@@ -1,4 +1,6 @@
-from hls4ml.model.graph import HLSConfig
+import numpy as np
+
+from hls4ml.model.graph import HLSConfig, ModelGraph
 
 
 def make_config(training=None, layer_training=None):
@@ -96,3 +98,88 @@ def test_trainable_precision_fields_are_immutable_to_callers():
     assert isinstance(fields, tuple)
     assert 'grad_in' in fields
     assert 'alpha' in fields
+
+
+def test_trainable_precision_config_merges_layer_overrides():
+    config = HLSConfig(
+        make_config(
+            {'Trainable': True, 'Precision': {'grad_in': 'ap_fixed<18,8>', 'grad_out': 'ap_fixed<19,9>'}},
+            {'Precision': {'grad_in': 'ap_fixed<12,4>'}},
+        )
+    )
+
+    precision_config = config.get_layer_trainable_precision_config(DummyLayer())
+
+    assert precision_config['grad_in'] == 'ap_fixed<12,4>'
+    assert precision_config['grad_out'] == 'ap_fixed<19,9>'
+
+
+def test_trainable_precision_accessor_converts_to_named_type_parts():
+    config = HLSConfig(make_config({'Trainable': True, 'Precision': {'grad_in': 'ap_fixed<18,8>'}}))
+
+    precision, type_name = config.get_trainable_precision(DummyLayer(), 'grad_in')
+
+    assert precision.width == 18
+    assert precision.integer == 8
+    assert type_name == 'dense_grad_in_t'
+
+
+def test_trainable_layer_attributes_are_created_from_precision_config():
+    layers = [
+        {'class_name': 'Input', 'name': 'input_layer', 'input_shape': [1]},
+        {
+            'class_name': 'Dense',
+            'name': 'dense',
+            'n_in': 1,
+            'n_out': 1,
+            'weight_data': np.array([[1.0]]),
+            'bias_data': np.array([0.0]),
+        },
+    ]
+    config = make_config(
+        {
+            'Trainable': True,
+            'Precision': {
+                'grad_in': 'ap_fixed<18,8>',
+                'grad_out': 'ap_fixed<18,8>',
+                'raw_update': 'ap_fixed<20,10>',
+                'alpha': 'ap_fixed<16,4>',
+            },
+        },
+        {'Precision': {'grad_in': 'ap_fixed<12,4>'}},
+    )
+    config['HLSConfig']['Flows'] = []
+
+    model = ModelGraph.from_layer_list(config, layers)
+    dense = model.graph['dense']
+
+    assert dense.get_attr('trainable') is True
+    assert dense.get_attr('grad_in_t').name == 'dense_grad_in_t'
+    assert dense.get_attr('grad_in_t').precision.width == 12
+    assert dense.get_attr('grad_in_t').precision.integer == 4
+    assert dense.get_attr('grad_out_t').precision.width == 18
+    assert dense.get_attr('raw_update_t').precision.width == 20
+    assert dense.get_attr('alpha_t').precision.width == 16
+    assert 'grad_in_t' in dense.types
+
+
+def test_trainable_layer_attributes_are_skipped_when_layer_is_not_trainable():
+    layers = [
+        {'class_name': 'Input', 'name': 'input_layer', 'input_shape': [1]},
+        {
+            'class_name': 'Dense',
+            'name': 'dense',
+            'n_in': 1,
+            'n_out': 1,
+            'weight_data': np.array([[1.0]]),
+            'bias_data': np.array([0.0]),
+        },
+    ]
+    config = make_config({'Trainable': True, 'Precision': {'grad_in': 'ap_fixed<18,8>'}}, {'Trainable': False})
+    config['HLSConfig']['Flows'] = []
+
+    model = ModelGraph.from_layer_list(config, layers)
+    dense = model.graph['dense']
+
+    assert dense.get_attr('trainable') is False
+    assert dense.get_attr('grad_in_t') is None

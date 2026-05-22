@@ -176,6 +176,25 @@ class HLSConfig(Serializable):
     def get_trainable_precision_fields(self):
         return self._trainable_precision_fields
 
+    def get_layer_trainable_precision_config(self, layer):
+        precision_config = self.get_trainable_precision_config()
+        layer_training_config = self.get_layer_trainable_config(layer)
+        precision_config.update(copy.deepcopy(layer_training_config.get('Precision', {})))
+
+        return precision_config
+
+    def get_trainable_precision(self, layer, var):
+        precision_config = self.get_layer_trainable_precision_config(layer)
+        precision = precision_config.get(var)
+
+        if precision is None:
+            raise Exception(f'No trainable precision for {layer.name}->{var} found.')
+
+        precision = self.backend.convert_precision_string(precision)
+        type_name = layer.name.lower() + '_' + var + '_t'
+
+        return precision, type_name
+
     def get_layer_trainable_config(self, layer):
         layer_config = self.get_layer_config(layer)
         training_config = copy.deepcopy(layer_config.get('Training', {}))
