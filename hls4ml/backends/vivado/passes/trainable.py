@@ -6,6 +6,9 @@ SUPPORTED_LOSSES = {'half_mse'}
 SUPPORTED_OPTIMIZERS = {'sgd'}
 SUPPORTED_CONTROLLERS = {'none', 'ctrl_gt_order_0', 'ctrl_gt_order_1', 'ctrl_gt_order_2', 'ctrl_gt_order_2_qa'}
 SUPPORTED_TRAINABLE_LAYERS = {'Dense'}
+LOSS_GRADIENT_SCALE = {
+    'half_mse': 1.0,
+}
 REQUIRED_TRAINABLE_PRECISION = (
     'grad_in',
     'grad_out',
@@ -70,6 +73,68 @@ def resolve_trainable_backward_order(model):
     model.trainable_output_layer = output_layer.name
 
     return True
+
+
+def resolve_trainable_loss_endpoints(model):
+    """Attach normalized loss endpoint metadata for trainable writer/template passes."""
+    if not model.config.is_trainable():
+        return False
+
+    if not hasattr(model, 'trainable_backward_order'):
+        raise Exception('Trainable loss endpoint resolution requires trainable backward order to be resolved first.')
+
+    loss_config = model.config.get_loss_config()
+    loss_kind = _normalize_choice(loss_config.get('Kind'))
+
+    if len(model.outputs) != 1:
+        raise Exception(f'Trainable hls4ml currently supports exactly one model output, got {len(model.outputs)}.')
+
+    output_name = _resolve_loss_output_name(model, loss_config)
+    output_variable = model.get_layer_output_variable(output_name)
+    if output_variable is None:
+        raise Exception(f'Unable to resolve trainable loss output variable {output_name}.')
+
+    output_layer_name = getattr(model, 'trainable_output_layer', None)
+    output_layer = model.graph.get(output_layer_name)
+    if output_layer is None:
+        raise Exception(f'Unable to resolve trainable loss output layer {output_layer_name}.')
+
+    endpoint = {
+        'index': 0,
+        'output_name': output_name,
+        'output_layer': output_layer.name,
+        'ground_truth_name': loss_config.get('GroundTruthName', f'{output_name}_truth'),
+        'loss_name': loss_kind,
+        'effective_loss_name': loss_kind,
+        'loss_input_name': output_name,
+        'loss_input_layer': output_layer.name,
+        'loss_input_type': output_variable.type.name,
+        'loss_input_shape': tuple(output_variable.shape),
+        'loss_input_size': output_variable.size(),
+        'loss_scalar_name': loss_config.get('LossScalarName', 'loss0'),
+        'loss_scalar_type': 'loss0_t',
+        'loss_gradient_name': loss_config.get('LossGradientName', f'{output_name}_loss_grad'),
+        'loss_gradient_type': f'{output_name}_loss_grad_t',
+        'loss_gradient_scale': LOSS_GRADIENT_SCALE[loss_kind],
+        'skip_backward_layer': None,
+    }
+
+    model.trainable_loss_endpoints = (endpoint,)
+
+    return True
+
+
+def _resolve_loss_output_name(model, loss_config):
+    configured_output = loss_config.get('Output')
+    if configured_output is None:
+        return model.outputs[0]
+
+    if configured_output not in model.outputs:
+        raise Exception(
+            f'Trainable loss output {configured_output} is not one of the model outputs: {", ".join(model.outputs)}.'
+        )
+
+    return configured_output
 
 
 def _producer_by_output(model):
@@ -201,4 +266,8 @@ def register_trainable(backend):
     backend.register_pass(
         'resolve_trainable_backward_order',
         ModelOptimizerPass('resolve_trainable_backward_order', resolve_trainable_backward_order),
+    )
+    backend.register_pass(
+        'resolve_trainable_loss_endpoints',
+        ModelOptimizerPass('resolve_trainable_loss_endpoints', resolve_trainable_loss_endpoints),
     )

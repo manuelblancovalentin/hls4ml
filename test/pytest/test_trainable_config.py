@@ -213,6 +213,7 @@ def test_vivado_trainable_flow_is_registered_before_writer():
     assert trainable_flow.optimizers == [
         'vivado:validate_trainable_config',
         'vivado:resolve_trainable_backward_order',
+        'vivado:resolve_trainable_loss_endpoints',
     ]
     assert 'vivado:trainable' in ip_flow.requires
 
@@ -372,3 +373,89 @@ def test_vivado_trainable_backward_order_rejects_branching_graph():
 
     with pytest.raises(Exception, match='supports only sequential graphs'):
         resolve_backward_order.transform(model)
+
+
+def test_vivado_trainable_loss_endpoint_resolves_half_mse_metadata():
+    layers = [
+        {'class_name': 'Input', 'name': 'input_layer', 'input_shape': [2]},
+        {
+            'class_name': 'Dense',
+            'name': 'dense',
+            'n_in': 2,
+            'n_out': 1,
+            'weight_data': np.ones((2, 1)),
+            'bias_data': np.zeros(1),
+        },
+    ]
+    config = make_config(
+        {
+            'Trainable': True,
+            'Loss': {
+                'Kind': 'half_mse',
+                'GroundTruthName': 'y_true',
+                'LossScalarName': 'train_loss',
+                'LossGradientName': 'dL_dy',
+            },
+            'Optimizer': {'Kind': 'sgd', 'LearningRate': 0.01},
+            'Controller': {'Kind': 'ctrl_gt_order_0'},
+            'Precision': TRAINABLE_PRECISION,
+        }
+    )
+    config['HLSConfig']['LayerName'] = {'input_layer': {'Training': {'Trainable': False}}}
+    config['HLSConfig']['Flows'] = []
+    model = ModelGraph.from_layer_list(config, layers)
+
+    get_optimizer('vivado:validate_trainable_config').transform(model)
+    get_optimizer('vivado:resolve_trainable_backward_order').transform(model)
+
+    assert get_optimizer('vivado:resolve_trainable_loss_endpoints').transform(model) is True
+
+    assert len(model.trainable_loss_endpoints) == 1
+    endpoint = model.trainable_loss_endpoints[0]
+    assert endpoint['output_name'] == 'dense'
+    assert endpoint['output_layer'] == 'dense'
+    assert endpoint['ground_truth_name'] == 'y_true'
+    assert endpoint['loss_name'] == 'half_mse'
+    assert endpoint['effective_loss_name'] == 'half_mse'
+    assert endpoint['loss_input_name'] == 'dense'
+    assert endpoint['loss_input_layer'] == 'dense'
+    assert endpoint['loss_input_shape'] == (1,)
+    assert endpoint['loss_input_size'] == 1
+    assert endpoint['loss_scalar_name'] == 'train_loss'
+    assert endpoint['loss_scalar_type'] == 'loss0_t'
+    assert endpoint['loss_gradient_name'] == 'dL_dy'
+    assert endpoint['loss_gradient_type'] == 'dense_loss_grad_t'
+    assert endpoint['loss_gradient_scale'] == 1.0
+    assert endpoint['skip_backward_layer'] is None
+
+
+def test_vivado_trainable_loss_endpoint_rejects_unknown_output_mapping():
+    layers = [
+        {'class_name': 'Input', 'name': 'input_layer', 'input_shape': [2]},
+        {
+            'class_name': 'Dense',
+            'name': 'dense',
+            'n_in': 2,
+            'n_out': 1,
+            'weight_data': np.ones((2, 1)),
+            'bias_data': np.zeros(1),
+        },
+    ]
+    config = make_config(
+        {
+            'Trainable': True,
+            'Loss': {'Kind': 'half_mse', 'Output': 'not_an_output'},
+            'Optimizer': {'Kind': 'sgd', 'LearningRate': 0.01},
+            'Controller': {'Kind': 'ctrl_gt_order_0'},
+            'Precision': TRAINABLE_PRECISION,
+        }
+    )
+    config['HLSConfig']['LayerName'] = {'input_layer': {'Training': {'Trainable': False}}}
+    config['HLSConfig']['Flows'] = []
+    model = ModelGraph.from_layer_list(config, layers)
+
+    get_optimizer('vivado:validate_trainable_config').transform(model)
+    get_optimizer('vivado:resolve_trainable_backward_order').transform(model)
+
+    with pytest.raises(Exception, match='not one of the model outputs'):
+        get_optimizer('vivado:resolve_trainable_loss_endpoints').transform(model)
