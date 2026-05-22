@@ -27,6 +27,29 @@ class HLSConfig(Serializable):
         config (dict):  The configuration dictionary
     """
 
+    _default_training_config = {
+        'Trainable': False,
+        'BatchSize': 1,
+        'Loss': {'Kind': None},
+        'Optimizer': {'Kind': 'sgd', 'LearningRate': None, 'LearningRateInput': None},
+        'Controller': {'Kind': 'none', 'SafetyBudget': {'Enabled': False}},
+        'Precision': {},
+    }
+    _trainable_precision_fields = (
+        'loss',
+        'loss_grad',
+        'grad_in',
+        'grad_out',
+        'weight_grad',
+        'bias_grad',
+        'gradient_accum',
+        'raw_update',
+        'update',
+        'optimizer_state',
+        'controller_metric',
+        'alpha',
+    )
+
     def __init__(self, config):
         self.config = config
         self.backend = get_backend(self.config.get('Backend', 'Vivado'))
@@ -117,6 +140,53 @@ class HLSConfig(Serializable):
             layer_config.update(name_config)
 
         return layer_config
+
+    def get_training_config(self):
+        hls_config = self.config['HLSConfig']
+        model_config = hls_config.get('Model', {})
+        training_config = copy.deepcopy(self._default_training_config)
+        configured_training = model_config.get('Training', {})
+
+        if isinstance(configured_training, bool):
+            configured_training = {'Trainable': configured_training}
+
+        for key, value in configured_training.items():
+            if isinstance(value, dict) and isinstance(training_config.get(key), dict):
+                training_config[key].update(value)
+            else:
+                training_config[key] = value
+
+        return training_config
+
+    def is_trainable(self):
+        return bool(self.get_training_config().get('Trainable', False))
+
+    def get_loss_config(self):
+        return copy.deepcopy(self.get_training_config().get('Loss', {}))
+
+    def get_optimizer_config(self):
+        return copy.deepcopy(self.get_training_config().get('Optimizer', {}))
+
+    def get_controller_config(self):
+        return copy.deepcopy(self.get_training_config().get('Controller', {}))
+
+    def get_trainable_precision_config(self):
+        return copy.deepcopy(self.get_training_config().get('Precision', {}))
+
+    def get_trainable_precision_fields(self):
+        return self._trainable_precision_fields
+
+    def get_layer_trainable_config(self, layer):
+        layer_config = self.get_layer_config(layer)
+        training_config = copy.deepcopy(layer_config.get('Training', {}))
+
+        if isinstance(training_config, bool):
+            training_config = {'Trainable': training_config}
+
+        if 'Trainable' not in training_config:
+            training_config['Trainable'] = self.is_trainable()
+
+        return training_config
 
     def set_name_config(self, name, config):
         """sets hls_config["LayerName"][name] = config"""
