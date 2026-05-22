@@ -7,6 +7,7 @@ except ImportError:
     __version__ = 'unknown version'
     version_tuple = (0, 0, 'unknown version')
 
+__trainable_version__ = '0.0.0alpha'
 
 def reseed(newseed):
     print(f'\npytest-randomly: reseed with {newseed}')
