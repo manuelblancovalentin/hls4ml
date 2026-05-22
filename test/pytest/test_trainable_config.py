@@ -210,7 +210,10 @@ def test_vivado_trainable_flow_is_registered_before_writer():
     ip_flow = get_flow(backend.get_default_flow())
 
     assert trainable_flow.requires == ['vivado:apply_templates']
-    assert trainable_flow.optimizers == ['vivado:validate_trainable_config']
+    assert trainable_flow.optimizers == [
+        'vivado:validate_trainable_config',
+        'vivado:resolve_trainable_backward_order',
+    ]
     assert 'vivado:trainable' in ip_flow.requires
 
 
@@ -271,3 +274,101 @@ def test_vivado_trainable_validation_rejects_missing_loss():
 
     with pytest.raises(Exception, match='supports losses'):
         validate_trainable_config.transform(model)
+
+
+def test_vivado_trainable_backward_order_resolves_sequential_dense_graph():
+    layers = [
+        {'class_name': 'Input', 'name': 'input_layer', 'input_shape': [2]},
+        {
+            'class_name': 'Dense',
+            'name': 'dense0',
+            'n_in': 2,
+            'n_out': 2,
+            'weight_data': np.ones((2, 2)),
+            'bias_data': np.zeros(2),
+        },
+        {
+            'class_name': 'Dense',
+            'name': 'dense1',
+            'inputs': ['dense0'],
+            'n_in': 2,
+            'n_out': 1,
+            'weight_data': np.ones((2, 1)),
+            'bias_data': np.zeros(1),
+        },
+    ]
+    config = make_config(
+        {
+            'Trainable': True,
+            'Loss': {'Kind': 'half_mse'},
+            'Optimizer': {'Kind': 'sgd', 'LearningRate': 0.01},
+            'Controller': {'Kind': 'ctrl_gt_order_0'},
+            'Precision': TRAINABLE_PRECISION,
+        }
+    )
+    config['HLSConfig']['LayerName'] = {'input_layer': {'Training': {'Trainable': False}}}
+    config['HLSConfig']['Flows'] = []
+    model = ModelGraph.from_layer_list(config, layers)
+
+    validate_trainable_config = get_optimizer('vivado:validate_trainable_config')
+    resolve_backward_order = get_optimizer('vivado:resolve_trainable_backward_order')
+
+    validate_trainable_config.transform(model)
+
+    assert resolve_backward_order.transform(model) is True
+    assert model.trainable_forward_path == ('input_layer', 'dense0', 'dense1')
+    assert model.trainable_forward_order == ('dense0', 'dense1')
+    assert model.trainable_backward_order == ('dense1', 'dense0')
+    assert model.trainable_output_layer == 'dense1'
+
+
+def test_vivado_trainable_backward_order_rejects_branching_graph():
+    layers = [
+        {'class_name': 'Input', 'name': 'input_layer', 'input_shape': [2]},
+        {
+            'class_name': 'Dense',
+            'name': 'dense0',
+            'n_in': 2,
+            'n_out': 2,
+            'weight_data': np.ones((2, 2)),
+            'bias_data': np.zeros(2),
+        },
+        {
+            'class_name': 'Dense',
+            'name': 'dense1',
+            'inputs': ['dense0'],
+            'n_in': 2,
+            'n_out': 1,
+            'weight_data': np.ones((2, 1)),
+            'bias_data': np.zeros(1),
+        },
+        {
+            'class_name': 'Dense',
+            'name': 'dense2',
+            'inputs': ['dense0'],
+            'n_in': 2,
+            'n_out': 1,
+            'weight_data': np.ones((2, 1)),
+            'bias_data': np.zeros(1),
+        },
+    ]
+    config = make_config(
+        {
+            'Trainable': True,
+            'Loss': {'Kind': 'half_mse'},
+            'Optimizer': {'Kind': 'sgd', 'LearningRate': 0.01},
+            'Controller': {'Kind': 'ctrl_gt_order_0'},
+            'Precision': TRAINABLE_PRECISION,
+        }
+    )
+    config['HLSConfig']['LayerName'] = {'input_layer': {'Training': {'Trainable': False}}}
+    config['HLSConfig']['Flows'] = []
+    model = ModelGraph.from_layer_list(config, layers, outputs=['dense1'])
+
+    validate_trainable_config = get_optimizer('vivado:validate_trainable_config')
+    resolve_backward_order = get_optimizer('vivado:resolve_trainable_backward_order')
+
+    validate_trainable_config.transform(model)
+
+    with pytest.raises(Exception, match='supports only sequential graphs'):
+        resolve_backward_order.transform(model)

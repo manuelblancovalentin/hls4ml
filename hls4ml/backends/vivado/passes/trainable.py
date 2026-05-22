@@ -42,6 +42,93 @@ def validate_trainable_config(model):
     return False
 
 
+def resolve_trainable_backward_order(model):
+    """Resolve the supported sequential backward traversal order."""
+    if not model.config.is_trainable():
+        return False
+
+    producer_by_output = _producer_by_output(model)
+    _reject_branching_outputs(model)
+
+    if len(model.outputs) != 1:
+        raise Exception(f'Trainable hls4ml currently supports exactly one model output, got {len(model.outputs)}.')
+
+    output_name = model.outputs[0]
+    output_layer = producer_by_output.get(output_name)
+    if output_layer is None:
+        raise Exception(f'Unable to resolve trainable output producer for model output {output_name}.')
+
+    forward_path = _resolve_single_path_to_input(model, producer_by_output, output_layer)
+    backward_order = [layer.name for layer in reversed(forward_path) if layer.get_attr('trainable', False)]
+
+    if len(backward_order) == 0:
+        raise Exception('Trainable hls4ml requires at least one trainable layer in the backward traversal.')
+
+    model.trainable_forward_path = tuple(layer.name for layer in forward_path)
+    model.trainable_forward_order = tuple(reversed(backward_order))
+    model.trainable_backward_order = tuple(backward_order)
+    model.trainable_output_layer = output_layer.name
+
+    return True
+
+
+def _producer_by_output(model):
+    producers = {}
+    for layer in model.get_layers():
+        for output in layer.outputs:
+            if output in producers:
+                raise Exception(f'Trainable hls4ml does not support duplicate output name {output}.')
+            producers[output] = layer
+    return producers
+
+
+def _reject_branching_outputs(model):
+    consumers = {}
+    for layer in model.get_layers():
+        for input_name in layer.inputs:
+            consumers.setdefault(input_name, []).append(layer)
+
+    for layer in model.get_layers():
+        for output in layer.outputs:
+            output_consumers = consumers.get(output, [])
+            if len(output_consumers) > 1:
+                consumer_names = ', '.join(consumer.name for consumer in output_consumers)
+                raise Exception(
+                    'Trainable hls4ml currently supports only sequential graphs. '
+                    f'Layer {layer.name} output {output} feeds multiple consumers: {consumer_names}.'
+                )
+
+
+def _resolve_single_path_to_input(model, producer_by_output, output_layer):
+    reverse_path = []
+    current_layer = output_layer
+
+    while current_layer is not None:
+        if len(current_layer.outputs) != 1:
+            raise Exception(
+                'Trainable hls4ml currently supports only single-output layers in backward traversal, '
+                f'got layer {current_layer.name}.'
+            )
+
+        reverse_path.append(current_layer)
+
+        if current_layer.name in model.inputs:
+            break
+
+        if len(current_layer.inputs) != 1:
+            raise Exception(
+                'Trainable hls4ml currently supports only single-input layers in backward traversal, '
+                f'got layer {current_layer.name}.'
+            )
+
+        current_layer = producer_by_output.get(current_layer.inputs[0])
+
+    if reverse_path[-1].name not in model.inputs:
+        raise Exception('Trainable hls4ml could not resolve a sequential path from output to model input.')
+
+    return list(reversed(reverse_path))
+
+
 def _validate_batch_size(training_config):
     batch_size = training_config.get('BatchSize')
     if not isinstance(batch_size, int) or batch_size < 1:
@@ -111,3 +198,7 @@ def _validate_trainable_precision(layer):
 
 def register_trainable(backend):
     backend.register_pass('validate_trainable_config', ModelOptimizerPass('validate_trainable_config', validate_trainable_config))
+    backend.register_pass(
+        'resolve_trainable_backward_order',
+        ModelOptimizerPass('resolve_trainable_backward_order', resolve_trainable_backward_order),
+    )
