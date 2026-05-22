@@ -1,5 +1,7 @@
 import numpy as np
 
+from hls4ml.backends import get_backend
+from hls4ml.model.flow import get_flow
 from hls4ml.model.graph import HLSConfig, ModelGraph
 
 
@@ -183,3 +185,13 @@ def test_trainable_layer_attributes_are_skipped_when_layer_is_not_trainable():
 
     assert dense.get_attr('trainable') is False
     assert dense.get_attr('grad_in_t') is None
+
+
+def test_vivado_trainable_flow_is_registered_before_writer():
+    backend = get_backend('Vivado')
+
+    trainable_flow = get_flow('vivado:trainable')
+    ip_flow = get_flow(backend.get_default_flow())
+
+    assert trainable_flow.requires == ['vivado:apply_templates']
+    assert 'vivado:trainable' in ip_flow.requires
