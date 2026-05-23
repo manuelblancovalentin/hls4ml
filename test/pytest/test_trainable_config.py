@@ -275,6 +275,34 @@ def test_vivado_trainable_validation_accepts_supported_dense_graph():
     assert validate_trainable_config.transform(model) is False
 
 
+def test_vivado_trainable_validation_normalizes_ctrl_none_spelling():
+    layers = [
+        {'class_name': 'Input', 'name': 'input_layer', 'input_shape': [1]},
+        {
+            'class_name': 'Dense',
+            'name': 'dense',
+            'n_in': 1,
+            'n_out': 1,
+            'weight_data': np.array([[1.0]]),
+            'bias_data': np.array([0.0]),
+        },
+    ]
+    config = make_config(
+        {
+            'Trainable': True,
+            'Loss': {'Kind': 'half_mse'},
+            'Optimizer': {'Kind': 'sgd', 'LearningRate': 0.01},
+            'Controller': {'Kind': 'CTRL-NONE'},
+            'Precision': TRAINABLE_PRECISION,
+        }
+    )
+    config['HLSConfig']['LayerName'] = {'input_layer': {'Training': {'Trainable': False}}}
+    config['HLSConfig']['Flows'] = []
+    model = ModelGraph.from_layer_list(config, layers)
+
+    assert get_optimizer('vivado:validate_trainable_config').transform(model) is False
+
+
 def test_vivado_trainable_validation_rejects_missing_loss():
     layers = [
         {'class_name': 'Input', 'name': 'input_layer', 'input_shape': [1]},

@@ -54,6 +54,12 @@ class VivadoWriter(Writer):
 
         return batch_size.bit_length() - 1
 
+    @staticmethod
+    def _normalize_trainable_choice(value):
+        if value is None:
+            return None
+        return str(value).strip().lower().replace('-', '_')
+
     def _make_trainable_loss_config(self, model, endpoint):
         output_layer = model.graph[endpoint['loss_input_layer']]
         output_variable = model.get_layer_output_variable(endpoint['loss_input_name'])
@@ -411,6 +417,39 @@ struct {config_name} {{
 
         return ' + '.join(f'(double){name}[0]' for name in loss_names)
 
+    def _make_trainable_weight_trace_header(self, model):
+        columns = ['epoch', 'sample', 'global_step', 'sample_index']
+        for layer_name in getattr(model, 'trainable_forward_order', ()):
+            layer = model.graph[layer_name]
+            if layer.class_name != 'Dense':
+                continue
+
+            n_weights = layer.get_attr('n_in') * layer.get_attr('n_out')
+            n_biases = layer.get_attr('n_out')
+            columns.extend(f'{layer.name}_weight_{index}' for index in range(n_weights))
+            columns.extend(f'{layer.name}_bias_{index}' for index in range(n_biases))
+
+        return ','.join(columns)
+
+    def _make_trainable_weight_trace_values(self, model, indent):
+        lines = []
+        for layer_name in getattr(model, 'trainable_forward_order', ()):
+            layer = model.graph[layer_name]
+            if layer.class_name != 'Dense':
+                continue
+
+            config = self._trainable_dense_config_name(layer)
+            weights = layer.get_weights('weight').name
+            biases = layer.get_weights('bias').name
+            lines.append(indent + f'for (unsigned i = 0; i < {config}::n_in * {config}::n_out; i++) {{\n')
+            lines.append(indent + f'    fweights << "," << (double){weights}[i];\n')
+            lines.append(indent + '}\n')
+            lines.append(indent + f'for (unsigned i = 0; i < {config}::n_out; i++) {{\n')
+            lines.append(indent + f'    fweights << "," << (double){biases}[i];\n')
+            lines.append(indent + '}\n')
+
+        return ''.join(lines)
+
     def _make_trainable_result_logging(self, model, indent):
         lines = []
         for out in model.get_output_variables():
@@ -477,6 +516,8 @@ struct {config_name} {{
 
         loss_expr = self._make_trainable_loss_log_expr(model)
         result_logging = self._make_trainable_result_logging(model, '            ')
+        weight_trace_header = self._make_trainable_weight_trace_header(model)
+        weight_trace_values = self._make_trainable_weight_trace_values(model, '            ')
 
         fout.write(
             f"""#include <algorithm>
@@ -576,10 +617,13 @@ int main(int argc, char **argv) {{
     std::ofstream fout(RESULTS_LOG);
     std::ofstream floss("tb_data/training/loss.dat");
     std::ofstream falpha("tb_data/training/alpha.dat");
+    std::ofstream fweights("tb_data/training/weights.dat");
     write_trainable_metadata(floss, "loss", run_datetime);
     floss << "epoch,sample,global_step,sample_index,loss" << std::endl;
     write_trainable_metadata(falpha, "alpha", run_datetime);
     falpha << "epoch,sample,global_step,sample_index,alpha" << std::endl;
+    write_trainable_metadata(fweights, "weights", run_datetime);
+    fweights << "{weight_trace_header}" << std::endl;
 
     std::cout << "============================================================" << std::endl;
     std::cout << "ENABOL + hls4ml-trainable CSIM training run" << std::endl;
@@ -642,6 +686,9 @@ int main(int argc, char **argv) {{
 
             std::cout << "Trainable epoch " << epoch << " average loss "
                       << epoch_loss / samples.size() << std::endl;
+            const long epoch_global_step = global_step == 0 ? 0 : (long)global_step - 1;
+            fweights << (epoch + 1) << "," << samples.size() << "," << epoch_global_step << ",-1";
+{weight_trace_values}            fweights << std::endl;
         }}
     }} else {{
         std::cout << "INFO: Unable to open input/predictions file, using default trainable input." << std::endl;
@@ -658,9 +705,11 @@ int main(int argc, char **argv) {{
     fout.close();
     floss.close();
     falpha.close();
+    fweights.close();
     std::cout << "INFO: Saved trainable inference results to file: " << RESULTS_LOG << std::endl;
     std::cout << "INFO: Saved trainable loss trace to file: tb_data/training/loss.dat" << std::endl;
     std::cout << "INFO: Saved trainable alpha trace to file: tb_data/training/alpha.dat" << std::endl;
+    std::cout << "INFO: Saved trainable weights trace to file: tb_data/training/weights.dat" << std::endl;
 
     return 0;
 }}
@@ -720,7 +769,7 @@ int main(int argc, char **argv) {{
         if not self._is_trainable_model(model):
             return ''
 
-        controller_kind = str(model.config.get_controller_config().get('Kind', 'none')).lower().replace('-', '_')
+        controller_kind = self._normalize_trainable_choice(model.config.get_controller_config().get('Kind', 'none'))
         if controller_kind not in ['none', 'ctrl_none']:
             raise Exception(
                 'Trainable Vivado writer currently emits only CTRL-NONE. '
