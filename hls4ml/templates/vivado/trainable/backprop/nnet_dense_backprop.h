@@ -2,6 +2,7 @@
 #define NNET_DENSE_BACKPROP_H_
 
 #include "ap_int.h"
+#include "../common/trainable_trace.h"
 
 namespace nnet {
 
@@ -97,6 +98,17 @@ namespace nnet {
                 avg >>= batch_shift;
                 bias_grad[j] = bias_grad_t(avg);
             }
+        }
+
+        HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_data_in_name, data_in, n_in);
+        HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_grad_in_name, grad_in, n_out);
+        HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_grad_out_name, grad_out, n_in);
+        HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_weight_grad_accum_name, weight_grad_accum, n_weights);
+        HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_bias_grad_accum_name, bias_grad_accum, n_out);
+
+        if (batch_end) {
+            HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_weight_grad_name, weight_grad, n_weights);
+            HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_bias_grad_name, bias_grad, n_out);
         }
 
     } // dense_backpass
