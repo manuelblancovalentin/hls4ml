@@ -584,9 +584,8 @@ def test_vivado_writer_emits_trainable_configs_and_copies_headers(tmp_path):
 
     assert (tmp_path / 'firmware' / 'trainable' / 'backprop' / 'nnet_dense_backprop.h').exists()
     assert (tmp_path / 'firmware' / 'trainable' / 'losses' / 'mse.h').exists()
-    assert '#include "firmware/parameters.h"' in inspect.getsource(writer._write_trainable_test_bench)
-    assert (
-        f'for (unsigned i = 0; i < {dense_config_name}::n_in * {dense_config_name}::n_out; i++)'
-        in writer._make_trainable_weight_trace_values(model, '')
-    )
+    assert '#include "firmware/parameters.h"' not in inspect.getsource(writer._write_trainable_test_bench)
+    assert 'extern model_default_t w2[1];' in writer._make_trainable_weight_trace_declarations(model)
+    assert 'extern model_default_t b2[1];' in writer._make_trainable_weight_trace_declarations(model)
+    assert 'for (unsigned i = 0; i < 1; i++)' in writer._make_trainable_weight_trace_values(model, '')
     assert 'fweights << "," << (double)w2[i];' in writer._make_trainable_weight_trace_values(model, '')

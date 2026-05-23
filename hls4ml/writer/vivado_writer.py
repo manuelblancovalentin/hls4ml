@@ -431,6 +431,22 @@ struct {config_name} {{
 
         return ','.join(columns)
 
+    def _make_trainable_weight_trace_declarations(self, model):
+        lines = []
+        for layer_name in getattr(model, 'trainable_forward_order', ()):
+            layer = model.graph[layer_name]
+            if layer.class_name != 'Dense':
+                continue
+
+            weights = layer.get_weights('weight')
+            biases = layer.get_weights('bias')
+            n_weights = layer.get_attr('n_in') * layer.get_attr('n_out')
+            n_biases = layer.get_attr('n_out')
+            lines.append(f'extern {weights.type.name} {weights.name}[{n_weights}];\n')
+            lines.append(f'extern {biases.type.name} {biases.name}[{n_biases}];\n')
+
+        return ''.join(lines)
+
     def _make_trainable_weight_trace_values(self, model, indent):
         lines = []
         for layer_name in getattr(model, 'trainable_forward_order', ()):
@@ -438,13 +454,14 @@ struct {config_name} {{
             if layer.class_name != 'Dense':
                 continue
 
-            config = self._trainable_dense_config_name(layer)
             weights = layer.get_weights('weight').name
             biases = layer.get_weights('bias').name
-            lines.append(indent + f'for (unsigned i = 0; i < {config}::n_in * {config}::n_out; i++) {{\n')
+            n_weights = layer.get_attr('n_in') * layer.get_attr('n_out')
+            n_biases = layer.get_attr('n_out')
+            lines.append(indent + f'for (unsigned i = 0; i < {n_weights}; i++) {{\n')
             lines.append(indent + f'    fweights << "," << (double){weights}[i];\n')
             lines.append(indent + '}\n')
-            lines.append(indent + f'for (unsigned i = 0; i < {config}::n_out; i++) {{\n')
+            lines.append(indent + f'for (unsigned i = 0; i < {n_biases}; i++) {{\n')
             lines.append(indent + f'    fweights << "," << (double){biases}[i];\n')
             lines.append(indent + '}\n')
 
@@ -517,6 +534,7 @@ struct {config_name} {{
         loss_expr = self._make_trainable_loss_log_expr(model)
         result_logging = self._make_trainable_result_logging(model, '            ')
         weight_trace_header = self._make_trainable_weight_trace_header(model)
+        weight_trace_declarations = self._make_trainable_weight_trace_declarations(model)
         weight_trace_values = self._make_trainable_weight_trace_values(model, '            ')
 
         fout.write(
@@ -536,10 +554,10 @@ struct {config_name} {{
 #include <vector>
 
 #include "firmware/{model.config.get_project_name()}.h"
-#include "firmware/parameters.h"
 #include "firmware/nnet_utils/nnet_helpers.h"
 
 {bram_includes}
+{weight_trace_declarations}
 #define CHECKPOINT 5000
 #define TRAINABLE_BATCH_SIZE {int(training_config.get('BatchSize', 1))}
 #define TRAINABLE_NUM_EPOCHS {epochs}
