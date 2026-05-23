@@ -1,0 +1,106 @@
+#ifndef NNET_DENSE_BACKPROP_H_
+#define NNET_DENSE_BACKPROP_H_
+
+#include "ap_int.h"
+
+namespace nnet {
+
+    template<typename CONFIG_T>
+    void dense_backpass(
+        const typename CONFIG_T::data_in_t data_in[CONFIG_T::n_in],
+        const typename CONFIG_T::grad_in_t grad_in[CONFIG_T::n_out],
+        const typename CONFIG_T::weight_t weights[CONFIG_T::n_in * CONFIG_T::n_out],
+
+        typename CONFIG_T::grad_out_t grad_out[CONFIG_T::n_in],
+
+        typename CONFIG_T::gradient_accum_t weight_grad_accum[CONFIG_T::n_in * CONFIG_T::n_out],
+        typename CONFIG_T::gradient_accum_t bias_grad_accum[CONFIG_T::n_out],
+
+        typename CONFIG_T::weight_grad_t weight_grad[CONFIG_T::n_in * CONFIG_T::n_out],
+        typename CONFIG_T::bias_grad_t bias_grad[CONFIG_T::n_out],
+
+        bool reset_accumulators,
+        bool batch_end
+    ) {
+
+        constexpr unsigned n_in = CONFIG_T::n_in;
+        constexpr unsigned n_out = CONFIG_T::n_out;
+        constexpr unsigned n_weights = CONFIG_T::n_in * CONFIG_T::n_out;
+
+        using accum_t = typename CONFIG_T::gradient_accum_t;
+        using weight_grad_t = typename CONFIG_T::weight_grad_t;
+        using bias_grad_t = typename CONFIG_T::bias_grad_t;
+        using grad_out_t = typename CONFIG_T::grad_out_t;
+
+        if (reset_accumulators) {
+            ResetWeightAccumulators:
+            for (unsigned i = 0; i < n_weights; i++) {
+                #pragma HLS PIPELINE II=1
+                weight_grad_accum[i] = 0;
+            }
+
+            ResetBiasAccumulators:
+            for (unsigned j = 0; j < n_out; j++) {
+                #pragma HLS PIPELINE II=1
+                bias_grad_accum[j] = 0;
+            }
+        }
+
+        // dL/dx_i = sum_j dL/dy_j * W_ij.
+        BackwardInputGradient:
+        for (unsigned i = 0; i < n_in; i++) {
+            #pragma HLS PIPELINE II=1
+            accum_t acc = 0;
+
+            BackwardInputGradientOut:
+            for (unsigned j = 0; j < n_out; j++) {
+                const unsigned idx = i * n_out + j;
+                acc += accum_t(weights[idx]) * accum_t(grad_in[j]);
+            }
+
+            grad_out[i] = grad_out_t(acc);
+        }
+
+        // dL/dW_ij = x_i * dL/dy_j.
+        AccumulateWeightGradient:
+        for (unsigned i = 0; i < n_in; i++) {
+            AccumulateWeightGradientOut:
+            for (unsigned j = 0; j < n_out; j++) {
+                #pragma HLS PIPELINE II=1
+                const unsigned idx = i * n_out + j;
+                weight_grad_accum[idx] += accum_t(data_in[i]) * accum_t(grad_in[j]);
+            }
+        }
+
+        // dL/db_j = dL/dy_j.
+        AccumulateBiasGradient:
+        for (unsigned j = 0; j < n_out; j++) {
+            #pragma HLS PIPELINE II=1
+            bias_grad_accum[j] += accum_t(grad_in[j]);
+        }
+
+        if (batch_end) {
+            const ap_uint<16> batch_shift = CONFIG_T::batch_size_log2;
+
+            EmitWeightGradient:
+            for (unsigned i = 0; i < n_weights; i++) {
+                #pragma HLS PIPELINE II=1
+                accum_t avg = weight_grad_accum[i];
+                avg >>= batch_shift;
+                weight_grad[i] = weight_grad_t(avg);
+            }
+
+            EmitBiasGradient:
+            for (unsigned j = 0; j < n_out; j++) {
+                #pragma HLS PIPELINE II=1
+                accum_t avg = bias_grad_accum[j];
+                avg >>= batch_shift;
+                bias_grad[j] = bias_grad_t(avg);
+            }
+        }
+
+    } // dense_backpass
+
+} // namespace nnet
+
+#endif
