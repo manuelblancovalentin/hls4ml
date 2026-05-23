@@ -150,6 +150,10 @@ struct {config_name} {{
         output_layer = model.graph[endpoint['loss_input_layer']]
         return self._trainable_type_name(output_layer, 'loss_t', endpoint['loss_input_type'])
 
+    @staticmethod
+    def _trainable_loss_prediction_name(model, endpoint):
+        return model.get_layer_output_variable(endpoint['loss_input_name']).name
+
     def _make_trainable_internal_buffers(self, model):
         if not self._is_trainable_model(model):
             return ''
@@ -158,23 +162,10 @@ struct {config_name} {{
 
         for endpoint in getattr(model, 'trainable_loss_endpoints', ()):
             lines.append(
-                '    {type} {name}[1];\n'.format(
-                    type=self._trainable_loss_type_name(model, endpoint), name=endpoint['loss_scalar_name']
-                )
-            )
-            lines.append(
                 '    {type} {name}[{size}];\n'.format(
                     type=endpoint['loss_gradient_type'],
                     name=endpoint['loss_gradient_name'],
                     size=endpoint['loss_input_size'],
-                )
-            )
-
-        if getattr(model, 'trainable_backward_order', ()):
-            first_layer = model.graph[model.trainable_backward_order[0]]
-            lines.append(
-                '    {type} trainable_alpha[1];\n'.format(
-                    type=self._trainable_type_name(first_layer, 'alpha_t')
                 )
             )
 
@@ -203,6 +194,192 @@ struct {config_name} {{
             lines.append(f'    {self._trainable_type_name(layer, "raw_update_t")} {prefix}_bias_update[{n_out}];\n')
 
         lines.append('\n')
+        return ''.join(lines)
+
+    def _trainable_learning_rate_input_name(self, model):
+        optimizer_config = model.config.get_optimizer_config()
+        learning_rate_input = optimizer_config.get('LearningRateInput')
+        if not learning_rate_input:
+            return None
+        if isinstance(learning_rate_input, str):
+            return learning_rate_input
+        return 'learning_rate'
+
+    def _trainable_learning_rate_expr(self, model, layer):
+        learning_rate_input = self._trainable_learning_rate_input_name(model)
+        if learning_rate_input is not None:
+            return learning_rate_input
+
+        optimizer_config = model.config.get_optimizer_config()
+        learning_rate = optimizer_config.get('LearningRate')
+        if learning_rate is None:
+            raise Exception('Trainable hls4ml requires a static or input learning rate for SGD emission.')
+
+        return f'{self._trainable_dense_config_name(layer)}::learning_rate_t({learning_rate})'
+
+    def _make_trainable_top_level_ports(self, model):
+        if not self._is_trainable_model(model):
+            return []
+
+        ports = []
+        for endpoint in getattr(model, 'trainable_loss_endpoints', ()):
+            ports.append(
+                {
+                    'type': endpoint['loss_input_type'],
+                    'name': endpoint['ground_truth_name'],
+                    'size': endpoint['loss_input_size'],
+                    'direction': 'input',
+                }
+            )
+            ports.append(
+                {
+                    'type': self._trainable_loss_type_name(model, endpoint),
+                    'name': endpoint['loss_scalar_name'],
+                    'size': 1,
+                    'direction': 'output',
+                }
+            )
+
+        if getattr(model, 'trainable_backward_order', ()):
+            first_layer = model.graph[model.trainable_backward_order[0]]
+            ports.append(
+                {
+                    'type': self._trainable_type_name(first_layer, 'alpha_t'),
+                    'name': 'trainable_alpha',
+                    'size': 1,
+                    'direction': 'output',
+                }
+            )
+
+            learning_rate_input = self._trainable_learning_rate_input_name(model)
+            if learning_rate_input is not None:
+                ports.append(
+                    {
+                        'type': self._trainable_type_name(first_layer, 'learning_rate_t', self._trainable_type_name(first_layer, 'alpha_t')),
+                        'name': learning_rate_input,
+                        'size': None,
+                        'direction': 'input',
+                    }
+                )
+
+        ports.extend(
+            [
+                {'type': 'bool', 'name': 'train_enable', 'size': None, 'direction': 'input'},
+                {'type': 'bool', 'name': 'reset_accumulators', 'size': None, 'direction': 'input'},
+                {'type': 'bool', 'name': 'batch_end', 'size': None, 'direction': 'input'},
+            ]
+        )
+
+        return ports
+
+    @staticmethod
+    def _port_definition(port):
+        if port['size'] is None:
+            return f"{port['type']} {port['name']}"
+        return f"{port['type']} {port['name']}[{port['size']}]"
+
+    @staticmethod
+    def _port_definition_bridge(port, dtype):
+        return f'{dtype} *{port["name"]}'
+
+    @staticmethod
+    def _port_call_name(port):
+        return port['name']
+
+    def _make_top_level_header(self, model, model_inputs, model_outputs, model_brams, indent):
+        port_defs = [i.definition_cpp(as_reference=True) for i in model_inputs]
+        port_defs.extend(o.definition_cpp(as_reference=True) for o in model_outputs)
+        port_defs.extend(self._port_definition(port) for port in self._make_trainable_top_level_ports(model))
+        port_defs.extend(indent + b.definition_cpp(as_reference=False) for b in model_brams)
+
+        return (',\n' + indent).join(port_defs) + '\n'
+
+    def _make_trainable_call_chain(self, model):
+        if not self._is_trainable_model(model):
+            return ''
+
+        controller_kind = str(model.config.get_controller_config().get('Kind', 'none')).lower().replace('-', '_')
+        if controller_kind != 'none':
+            raise Exception(
+                'Trainable Vivado writer currently emits only CTRL-NONE. '
+                f'Controller {model.config.get_controller_config().get("Kind")} is not wired yet.'
+            )
+
+        lines = ['    // Trainable loss, backprop, optimizer, and update path\n', '    if (train_enable) {\n']
+
+        for endpoint in getattr(model, 'trainable_loss_endpoints', ()):
+            lines.append(
+                '        nnet::{loss}<{config}>({prediction}, {truth}, {loss_out}, {loss_grad});\n'.format(
+                    loss=endpoint['effective_loss_name'],
+                    config=self._trainable_loss_config_name(endpoint),
+                    prediction=self._trainable_loss_prediction_name(model, endpoint),
+                    truth=endpoint['ground_truth_name'],
+                    loss_out=endpoint['loss_scalar_name'],
+                    loss_grad=endpoint['loss_gradient_name'],
+                )
+            )
+
+        backward_order = getattr(model, 'trainable_backward_order', ())
+        for index, layer_name in enumerate(backward_order):
+            layer = model.graph[layer_name]
+            if layer.class_name != 'Dense':
+                continue
+
+            grad_in = model.trainable_loss_endpoints[0]['loss_gradient_name'] if index == 0 else f'{backward_order[index - 1]}_grad_out'
+            prefix = layer.name
+            lines.append(
+                '        nnet::dense_backpass<{config}>({data_in}, {grad_in}, {weights}, {grad_out}, '
+                '{weight_accum}, {bias_accum}, {weight_grad}, {bias_grad}, reset_accumulators, batch_end);\n'.format(
+                    config=self._trainable_dense_config_name(layer),
+                    data_in=layer.get_input_variable().name,
+                    grad_in=grad_in,
+                    weights=layer.get_weights('weight').name,
+                    grad_out=f'{prefix}_grad_out',
+                    weight_accum=f'{prefix}_weight_grad_accum',
+                    bias_accum=f'{prefix}_bias_grad_accum',
+                    weight_grad=f'{prefix}_weight_grad',
+                    bias_grad=f'{prefix}_bias_grad',
+                )
+            )
+
+        if backward_order:
+            lines.append('        if (batch_end) {\n')
+            for layer_name in backward_order:
+                layer = model.graph[layer_name]
+                if layer.class_name != 'Dense':
+                    continue
+                prefix = layer.name
+                lines.append(
+                    '            nnet::sgd<{config}>({weight_grad}, {bias_grad}, {weight_update}, {bias_update}, {learning_rate});\n'.format(
+                        config=self._trainable_dense_config_name(layer),
+                        weight_grad=f'{prefix}_weight_grad',
+                        bias_grad=f'{prefix}_bias_grad',
+                        weight_update=f'{prefix}_weight_update',
+                        bias_update=f'{prefix}_bias_update',
+                        learning_rate=self._trainable_learning_rate_expr(model, layer),
+                    )
+                )
+
+            first_layer = model.graph[backward_order[0]]
+            lines.append(f'            nnet::global_throttle_none<{self._trainable_dense_config_name(first_layer)}>(trainable_alpha);\n')
+
+            for layer_name in backward_order:
+                layer = model.graph[layer_name]
+                if layer.class_name != 'Dense':
+                    continue
+                prefix = layer.name
+                lines.append(
+                    '            nnet::apply_dense_update<{config}>({weights}, {biases}, {weight_update}, {bias_update}, trainable_alpha);\n'.format(
+                        config=self._trainable_dense_config_name(layer),
+                        weights=layer.get_weights('weight').name,
+                        biases=layer.get_weights('bias').name,
+                        weight_update=f'{prefix}_weight_update',
+                        bias_update=f'{prefix}_bias_update',
+                    )
+                )
+            lines.append('        }\n')
+
+        lines.append('    }\n\n')
         return ''.join(lines)
 
     def print_array_to_cpp(self, var, odir, namespace=None, write_txt_file=True):
@@ -327,16 +504,7 @@ struct {config_name} {{
                 newline = line.replace('myproject', model.config.get_project_name())
 
             elif '// hls-fpga-machine-learning insert header' in line:
-                inputs_str = ', '.join([i.definition_cpp(as_reference=True) for i in model_inputs])
-                outputs_str = ', '.join([o.definition_cpp(as_reference=True) for o in model_outputs])
-                brams_str = ', \n'.join([indent + b.definition_cpp(as_reference=False) for b in model_brams])
-
-                newline = ''
-                newline += indent + inputs_str + ',\n'
-                newline += indent + outputs_str
-                if len(model_brams) > 0:
-                    newline += ',\n' + brams_str
-                newline += '\n'
+                newline = indent + self._make_top_level_header(model, model_inputs, model_outputs, model_brams, indent)
 
             elif '// hls-fpga-machine-learning insert namespace-start' in line:
                 newline = ''
@@ -390,6 +558,8 @@ struct {config_name} {{
                 all_inputs = [i.name for i in model_inputs]
                 all_outputs = [o.name for o in model_outputs]
                 all_brams = [b.name for b in model_brams]
+                trainable_ports = self._make_trainable_top_level_ports(model)
+                trainable_port_names = [port['name'] for port in trainable_ports]
                 io_type = model.config.get_config_value('IOType')
 
                 pipeline_style = model.config.pipeline_style
@@ -405,16 +575,21 @@ struct {config_name} {{
                         newline += indent + self._make_array_pragma(i) + '\n'
                     for o in model_outputs:
                         newline += indent + self._make_array_pragma(o) + '\n'
+                    for port in trainable_ports:
+                        if port['size'] is not None:
+                            newline += indent + '#pragma HLS ARRAY_PARTITION variable={} complete dim=0\n'.format(
+                                port['name']
+                            )
                     # TODO discussed adding a handle for setting the interface mode for individual input and output arrays
                     # Probably the handle doesn't need to be exposed to the user but should be just set in hls_model.py
                     newline += indent + '#pragma HLS INTERFACE ap_vld port={},{} \n'.format(
-                        ','.join(all_inputs), ','.join(all_outputs)
+                        ','.join(all_inputs + trainable_port_names), ','.join(all_outputs)
                     )
                     newline += pipeline_pragma
 
                 if io_type == 'io_stream':
                     newline += indent + '#pragma HLS INTERFACE axis port={},{} \n'.format(
-                        ','.join(all_inputs), ','.join(all_outputs)
+                        ','.join(all_inputs + trainable_port_names), ','.join(all_outputs)
                     )
                     if all_brams:
                         newline += indent + '#pragma HLS INTERFACE bram port={} \n'.format(','.join(all_brams))
@@ -452,6 +627,7 @@ struct {config_name} {{
                                 )
                             newline += '#endif\n'
                         newline += '\n'
+                newline += self._make_trainable_call_chain(model)
 
             # Just copy line
             else:
@@ -487,16 +663,7 @@ struct {config_name} {{
                 newline = line.replace('myproject', model.config.get_project_name())
 
             elif '// hls-fpga-machine-learning insert header' in line:
-                inputs_str = ', '.join([i.definition_cpp(as_reference=True) for i in model_inputs])
-                outputs_str = ', '.join([o.definition_cpp(as_reference=True) for o in model_outputs])
-                brams_str = ', \n'.join([indent + b.definition_cpp(as_reference=False) for b in model_brams])
-
-                newline = ''
-                newline += indent + inputs_str + ',\n'
-                newline += indent + outputs_str
-                if len(model_brams) > 0:
-                    newline += ',\n' + brams_str
-                newline += '\n'
+                newline = indent + self._make_top_level_header(model, model_inputs, model_outputs, model_brams, indent)
 
             elif '// hls-fpga-machine-learning insert namespace-start' in line:
                 newline = ''
