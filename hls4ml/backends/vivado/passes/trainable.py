@@ -4,7 +4,7 @@ from hls4ml.utils.string_utils import convert_to_snake_case
 
 SUPPORTED_LOSSES = {'half_mse'}
 SUPPORTED_OPTIMIZERS = {'sgd'}
-SUPPORTED_CONTROLLERS = {'none', 'CTRL-NONE', 'ctrl_gt_order_0', 'ctrl_gt_order_1', 'ctrl_gt_order_2', 'ctrl_gt_order_2_qa'}
+SUPPORTED_CONTROLLERS = {'none', 'ctrl_none', 'ctrl_gt_order_0', 'ctrl_gt_order_1', 'ctrl_gt_order_2', 'ctrl_gt_order_2_qa'}
 SUPPORTED_TRAINABLE_LAYERS = {'Dense'}
 LOSS_GRADIENT_SCALE = {
     'half_mse': 1.0,
