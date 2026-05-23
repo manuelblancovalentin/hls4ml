@@ -35,6 +35,8 @@ class HLSConfig(Serializable):
         'Shuffle': True,
         'ShuffleSeed': 13,
         'LogEvery': 1,
+        'Trace': {'Loss': True, 'Alpha': True},
+        'Metadata': {'GeneratedBy': 'hls4ml-trainable', 'EnabolVersion': 'unknown', 'Hls4mlTrainableVersion': '0.0.0a'},
         'Loss': {'Kind': None},
         'Optimizer': {'Kind': 'sgd', 'LearningRate': None, 'LearningRateInput': None},
         'Controller': {'Kind': 'none', 'SafetyBudget': {'Enabled': False}},

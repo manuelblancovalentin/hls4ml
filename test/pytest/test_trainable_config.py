@@ -59,6 +59,8 @@ def test_training_config_defaults_to_inference():
     assert config.get_training_config()['Shuffle'] is True
     assert config.get_training_config()['ShuffleSeed'] == 13
     assert config.get_training_config()['LogEvery'] == 1
+    assert config.get_training_config()['Trace'] == {'Loss': True, 'Alpha': True}
+    assert config.get_training_config()['Metadata']['GeneratedBy'] == 'hls4ml-trainable'
     assert config.get_loss_config() == {'Kind': None}
     assert config.get_optimizer_config()['Kind'] == 'sgd'
     assert config.get_controller_config()['Kind'] == 'none'
@@ -74,6 +76,8 @@ def test_training_config_merges_model_schema_sections():
                 'Shuffle': False,
                 'ShuffleSeed': 7,
                 'LogEvery': 2,
+                'Trace': {'Loss': False},
+                'Metadata': {'GeneratedBy': 'enabol+hls4ml-trainable', 'EnabolVersion': '0.1.0'},
                 'Loss': {'Kind': 'half_mse', 'Output': 'output'},
                 'Optimizer': {'LearningRate': 0.01},
                 'Controller': {'Kind': 'ctrl_gt_order_0'},
@@ -88,6 +92,10 @@ def test_training_config_merges_model_schema_sections():
     assert config.get_training_config()['Shuffle'] is False
     assert config.get_training_config()['ShuffleSeed'] == 7
     assert config.get_training_config()['LogEvery'] == 2
+    assert config.get_training_config()['Trace'] == {'Loss': False, 'Alpha': True}
+    assert config.get_training_config()['Metadata']['GeneratedBy'] == 'enabol+hls4ml-trainable'
+    assert config.get_training_config()['Metadata']['EnabolVersion'] == '0.1.0'
+    assert config.get_training_config()['Metadata']['Hls4mlTrainableVersion'] == '0.0.0a'
     assert config.get_loss_config() == {'Kind': 'half_mse', 'Output': 'output'}
     assert config.get_optimizer_config() == {'Kind': 'sgd', 'LearningRate': 0.01, 'LearningRateInput': None}
     assert config.get_controller_config()['Kind'] == 'ctrl_gt_order_0'
