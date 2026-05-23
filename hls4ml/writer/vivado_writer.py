@@ -286,6 +286,9 @@ struct {config_name} {{
     def _port_call_name(port):
         return port['name']
 
+    def _make_trainable_top_level_call_args(self, model):
+        return [self._port_call_name(port) for port in self._make_trainable_top_level_ports(model)]
+
     def _make_top_level_header(self, model, model_inputs, model_outputs, model_brams, indent):
         port_defs = [i.definition_cpp(as_reference=True) for i in model_inputs]
         port_defs.extend(o.definition_cpp(as_reference=True) for o in model_outputs)
@@ -293,6 +296,154 @@ struct {config_name} {{
         port_defs.extend(indent + b.definition_cpp(as_reference=False) for b in model_brams)
 
         return (',\n' + indent).join(port_defs) + '\n'
+
+    def _make_trainable_testbench_data(self, model, indent, index_name):
+        if not self._is_trainable_model(model):
+            return ''
+
+        lines = []
+        for endpoint in getattr(model, 'trainable_loss_endpoints', ()):
+            lines.append(
+                indent
+                + '{type} {name}[{size}];\n'.format(
+                    type=endpoint['loss_input_type'],
+                    name=endpoint['ground_truth_name'],
+                    size=endpoint['loss_input_size'],
+                )
+            )
+            lines.append(
+                indent
+                + 'nnet::copy_data<float, {type}, 0, {size}>(pr, {name});\n'.format(
+                    type=endpoint['loss_input_type'],
+                    size=endpoint['loss_input_size'],
+                    name=endpoint['ground_truth_name'],
+                )
+            )
+            lines.append(
+                indent
+                + '{type} {name}[1];\n'.format(
+                    type=self._trainable_loss_type_name(model, endpoint),
+                    name=endpoint['loss_scalar_name'],
+                )
+            )
+
+        if getattr(model, 'trainable_backward_order', ()):
+            first_layer = model.graph[model.trainable_backward_order[0]]
+            lines.append(indent + f'{self._trainable_type_name(first_layer, "alpha_t")} trainable_alpha[1];\n')
+
+            learning_rate_input = self._trainable_learning_rate_input_name(model)
+            if learning_rate_input is not None:
+                learning_rate = model.config.get_optimizer_config().get('LearningRate', 0)
+                lines.append(
+                    indent
+                    + f'{self._trainable_type_name(first_layer, "learning_rate_t", self._trainable_type_name(first_layer, "alpha_t"))} '
+                    + f'{learning_rate_input} = {learning_rate};\n'
+                )
+
+        batch_size = int(model.config.get_training_config().get('BatchSize', 1))
+        lines.append(indent + 'bool train_enable = true;\n')
+        lines.append(indent + f'bool reset_accumulators = (({index_name} % {batch_size}) == 0);\n')
+        lines.append(indent + f'bool batch_end = ((({index_name} + 1) % {batch_size}) == 0);\n')
+
+        return ''.join(lines)
+
+    def _make_trainable_zero_data(self, model, indent, index_name):
+        if not self._is_trainable_model(model):
+            return ''
+
+        lines = []
+        for endpoint in getattr(model, 'trainable_loss_endpoints', ()):
+            lines.append(
+                indent
+                + '{type} {name}[{size}];\n'.format(
+                    type=endpoint['loss_input_type'],
+                    name=endpoint['ground_truth_name'],
+                    size=endpoint['loss_input_size'],
+                )
+            )
+            lines.append(
+                indent
+                + 'nnet::fill_zero<{type}, {size}>({name});\n'.format(
+                    type=endpoint['loss_input_type'],
+                    size=endpoint['loss_input_size'],
+                    name=endpoint['ground_truth_name'],
+                )
+            )
+            lines.append(
+                indent
+                + '{type} {name}[1];\n'.format(
+                    type=self._trainable_loss_type_name(model, endpoint),
+                    name=endpoint['loss_scalar_name'],
+                )
+            )
+
+        if getattr(model, 'trainable_backward_order', ()):
+            first_layer = model.graph[model.trainable_backward_order[0]]
+            lines.append(indent + f'{self._trainable_type_name(first_layer, "alpha_t")} trainable_alpha[1];\n')
+
+            learning_rate_input = self._trainable_learning_rate_input_name(model)
+            if learning_rate_input is not None:
+                learning_rate = model.config.get_optimizer_config().get('LearningRate', 0)
+                lines.append(
+                    indent
+                    + f'{self._trainable_type_name(first_layer, "learning_rate_t", self._trainable_type_name(first_layer, "alpha_t"))} '
+                    + f'{learning_rate_input} = {learning_rate};\n'
+                )
+
+        batch_size = int(model.config.get_training_config().get('BatchSize', 1))
+        lines.append(indent + 'bool train_enable = true;\n')
+        lines.append(indent + f'bool reset_accumulators = (({index_name} % {batch_size}) == 0);\n')
+        lines.append(indent + f'bool batch_end = ((({index_name} + 1) % {batch_size}) == 0);\n')
+
+        return ''.join(lines)
+
+    def _make_trainable_bridge_defaults(self, model, indent):
+        if not self._is_trainable_model(model):
+            return ''
+
+        lines = []
+        for endpoint in getattr(model, 'trainable_loss_endpoints', ()):
+            lines.append(
+                indent
+                + '{type} {name}[{size}];\n'.format(
+                    type=endpoint['loss_input_type'],
+                    name=endpoint['ground_truth_name'],
+                    size=endpoint['loss_input_size'],
+                )
+            )
+            lines.append(
+                indent
+                + 'nnet::fill_zero<{type}, {size}>({name});\n'.format(
+                    type=endpoint['loss_input_type'],
+                    size=endpoint['loss_input_size'],
+                    name=endpoint['ground_truth_name'],
+                )
+            )
+            lines.append(
+                indent
+                + '{type} {name}[1];\n'.format(
+                    type=self._trainable_loss_type_name(model, endpoint),
+                    name=endpoint['loss_scalar_name'],
+                )
+            )
+
+        if getattr(model, 'trainable_backward_order', ()):
+            first_layer = model.graph[model.trainable_backward_order[0]]
+            lines.append(indent + f'{self._trainable_type_name(first_layer, "alpha_t")} trainable_alpha[1];\n')
+
+            learning_rate_input = self._trainable_learning_rate_input_name(model)
+            if learning_rate_input is not None:
+                lines.append(
+                    indent
+                    + f'{self._trainable_type_name(first_layer, "learning_rate_t", self._trainable_type_name(first_layer, "alpha_t"))} '
+                    + f'{learning_rate_input} = 0;\n'
+                )
+
+        lines.append(indent + 'bool train_enable = false;\n')
+        lines.append(indent + 'bool reset_accumulators = false;\n')
+        lines.append(indent + 'bool batch_end = false;\n')
+
+        return ''.join(lines)
 
     def _make_trainable_call_chain(self, model):
         if not self._is_trainable_model(model):
@@ -961,6 +1112,7 @@ struct {config_name} {{
                     offset += inp.size()
                 for out in model_outputs:
                     newline += '      ' + out.definition_cpp() + ';\n'
+                newline += self._make_trainable_testbench_data(model, '      ', 'e')
 
             elif '// hls-fpga-machine-learning insert zero' in line:
                 newline = line
@@ -969,6 +1121,7 @@ struct {config_name} {{
                     newline += indent + f'nnet::fill_zero<{inp.type.name}, {inp.size_cpp()}>({inp.name});\n'
                 for out in model_outputs:
                     newline += indent + out.definition_cpp() + ';\n'
+                newline += self._make_trainable_zero_data(model, indent, 'i')
 
             elif '// hls-fpga-machine-learning insert top-level-function' in line:
                 newline = line
@@ -976,9 +1129,10 @@ struct {config_name} {{
                 input_vars = ','.join([i.name for i in model_inputs])
                 output_vars = ','.join([o.name for o in model_outputs])
                 bram_vars = ','.join([b.name for b in model_brams])
+                trainable_vars = ','.join(self._make_trainable_top_level_call_args(model))
 
                 # Concatenate the input, output, and bram variables. Filter out empty/null values
-                all_vars = ','.join(filter(None, [input_vars, output_vars, bram_vars]))
+                all_vars = ','.join(filter(None, [input_vars, output_vars, trainable_vars, bram_vars]))
 
                 top_level = indent + f'{model.config.get_project_name()}({all_vars});\n'
 
@@ -1078,14 +1232,16 @@ struct {config_name} {{
                 for o in model_outputs:
                     newline += indent + '{var};\n'.format(var=o.definition_cpp(name_suffix='_ap'))
 
+                newline += self._make_trainable_bridge_defaults(model, indent)
                 newline += '\n'
 
                 input_vars = ','.join([i.name + '_ap' for i in model_inputs])
                 bram_vars = ','.join([b.name for b in model_brams])
                 output_vars = ','.join([o.name + '_ap' for o in model_outputs])
+                trainable_vars = ','.join(self._make_trainable_top_level_call_args(model))
 
                 # Concatenate the input, output, and bram variables. Filter out empty/null values
-                all_vars = ','.join(filter(None, [input_vars, output_vars, bram_vars]))
+                all_vars = ','.join(filter(None, [input_vars, output_vars, trainable_vars, bram_vars]))
 
                 top_level = indent + f'{model.config.get_project_name()}({all_vars});\n'
                 newline += top_level
