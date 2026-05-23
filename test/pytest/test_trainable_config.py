@@ -1,3 +1,5 @@
+import inspect
+
 import numpy as np
 import pytest
 
@@ -582,3 +584,9 @@ def test_vivado_writer_emits_trainable_configs_and_copies_headers(tmp_path):
 
     assert (tmp_path / 'firmware' / 'trainable' / 'backprop' / 'nnet_dense_backprop.h').exists()
     assert (tmp_path / 'firmware' / 'trainable' / 'losses' / 'mse.h').exists()
+    assert '#include "firmware/parameters.h"' in inspect.getsource(writer._write_trainable_test_bench)
+    assert (
+        f'for (unsigned i = 0; i < {dense_config_name}::n_in * {dense_config_name}::n_out; i++)'
+        in writer._make_trainable_weight_trace_values(model, '')
+    )
+    assert 'fweights << "," << (double)w2[i];' in writer._make_trainable_weight_trace_values(model, '')

@@ -536,6 +536,7 @@ struct {config_name} {{
 #include <vector>
 
 #include "firmware/{model.config.get_project_name()}.h"
+#include "firmware/parameters.h"
 #include "firmware/nnet_utils/nnet_helpers.h"
 
 {bram_includes}
