@@ -83,19 +83,24 @@ struct {config_name} {{
 
     def _make_trainable_dense_config(self, model, layer):
         training_config = model.config.get_training_config()
+        optimizer_config = model.config.get_optimizer_config()
         input_type = layer.get_input_variable().type.name
         output_type = layer.get_output_variable().type.name
         weight_type = layer.get_weights('weight').type.name
         bias_type = layer.get_weights('bias').type.name
         config_name = self._trainable_dense_config_name(layer)
         batch_size_log2 = self._batch_size_log2(training_config)
+        learning_rate = optimizer_config.get('LearningRate')
+        learning_rate_decl = ''
+        if self._trainable_learning_rate_input_name(model) is None and learning_rate is not None:
+            learning_rate_decl = f'    static constexpr double learning_rate = {learning_rate};\n'
 
         return f"""// Trainable Dense state for {layer.name}
 struct {config_name} {{
     static const unsigned n_in = {layer.get_attr('n_in')};
     static const unsigned n_out = {layer.get_attr('n_out')};
     static const unsigned batch_size_log2 = {batch_size_log2};
-    typedef {input_type} data_in_t;
+{learning_rate_decl}    typedef {input_type} data_in_t;
     typedef {output_type} data_out_t;
     typedef {weight_type} weight_t;
     typedef {bias_type} bias_t;
@@ -165,7 +170,7 @@ struct {config_name} {{
                 '    {type} {name}[{size}];\n'.format(
                     type=endpoint['loss_gradient_type'],
                     name=endpoint['loss_gradient_name'],
-                    size=endpoint['loss_input_size'],
+                    size=f'{self._trainable_loss_config_name(endpoint)}::n_out',
                 )
             )
 
@@ -174,10 +179,11 @@ struct {config_name} {{
             if layer.class_name != 'Dense':
                 continue
 
-            n_in = layer.get_attr('n_in')
-            n_out = layer.get_attr('n_out')
-            n_weights = n_in * n_out
             prefix = layer.name
+            config = self._trainable_dense_config_name(layer)
+            n_in = f'{config}::n_in'
+            n_out = f'{config}::n_out'
+            n_weights = f'{config}::n_in * {config}::n_out'
 
             lines.append(f'    {self._trainable_type_name(layer, "grad_out_t")} {prefix}_grad_out[{n_in}];\n')
             lines.append(
@@ -215,7 +221,8 @@ struct {config_name} {{
         if learning_rate is None:
             raise Exception('Trainable hls4ml requires a static or input learning rate for SGD emission.')
 
-        return f'{self._trainable_dense_config_name(layer)}::learning_rate_t({learning_rate})'
+        config_name = self._trainable_dense_config_name(layer)
+        return f'{config_name}::learning_rate_t({config_name}::learning_rate)'
 
     def _make_trainable_top_level_ports(self, model):
         if not self._is_trainable_model(model):
@@ -396,6 +403,209 @@ struct {config_name} {{
         lines.append(indent + f'bool batch_end = ((({index_name} + 1) % {batch_size}) == 0);\n')
 
         return ''.join(lines)
+
+    def _make_trainable_loss_log_expr(self, model):
+        loss_names = [endpoint['loss_scalar_name'] for endpoint in getattr(model, 'trainable_loss_endpoints', ())]
+        if not loss_names:
+            return '0.0'
+
+        return ' + '.join(f'(double){name}[0]' for name in loss_names)
+
+    def _make_trainable_result_logging(self, model, indent):
+        lines = []
+        for out in model.get_output_variables():
+            lines.append(indent + f'nnet::print_result<{out.type.name}, {out.size_cpp()}>({out.name}, fout);\n')
+        return ''.join(lines)
+
+    def _make_trainable_prediction_logging(self, model, indent):
+        lines = []
+        for out in model.get_output_variables():
+            lines.append(indent + f'for(int i = 0; i < {out.size_cpp()}; i++) {{\n')
+            lines.append(indent + '  std::cout << ' + out.name + '[i] << " ";\n')
+            lines.append(indent + '}\n')
+            lines.append(indent + 'std::cout << std::endl;\n')
+        return ''.join(lines)
+
+    def _write_trainable_test_bench(self, model, filedir):
+        """Write an epoch-based C simulation testbench for trainable models."""
+
+        fout = open(f'{model.config.get_output_dir()}/{model.config.get_project_name()}_test.cpp', 'w')
+
+        model_inputs = model.get_input_variables()
+        model_outputs = model.get_output_variables()
+        model_brams = [var for var in model.get_weight_variables() if getattr(var, 'storage', '').lower() == 'bram']
+        training_config = model.config.get_training_config()
+        epochs = int(training_config.get('Epochs', 1))
+        shuffle = str(bool(training_config.get('Shuffle', True))).lower()
+        shuffle_seed = int(training_config.get('ShuffleSeed', 13))
+        log_every = int(training_config.get('LogEvery', 1))
+
+        namespace = model.config.get_writer_config().get('Namespace', None)
+        namespace_line = f'    using namespace {namespace};\n' if namespace is not None else ''
+        bram_includes = ''.join(f'#include "firmware/weights/{bram.name}.h"\n' for bram in model_brams)
+
+        data_lines = []
+        offset = 0
+        for inp in model_inputs:
+            data_lines.append('            ' + inp.definition_cpp() + ';\n')
+            data_lines.append(
+                '            nnet::copy_data<float, {}, {}, {}>(in, {});\n'.format(
+                    inp.type.name, offset, inp.size_cpp(), inp.name
+                )
+            )
+            offset += inp.size()
+        for out in model_outputs:
+            data_lines.append('            ' + out.definition_cpp() + ';\n')
+        data_lines.append(self._make_trainable_testbench_data(model, '            ', 'sample_step'))
+
+        zero_lines = []
+        for inp in model_inputs:
+            zero_lines.append('            ' + inp.definition_cpp() + ';\n')
+            zero_lines.append('            ' + f'nnet::fill_zero<{inp.type.name}, {inp.size_cpp()}>({inp.name});\n')
+        for out in model_outputs:
+            zero_lines.append('            ' + out.definition_cpp() + ';\n')
+        zero_lines.append(self._make_trainable_zero_data(model, '            ', 'sample_step'))
+
+        input_vars = ','.join([i.name for i in model_inputs])
+        output_vars = ','.join([o.name for o in model_outputs])
+        bram_vars = ','.join([b.name for b in model_brams])
+        trainable_vars = ','.join(self._make_trainable_top_level_call_args(model))
+        all_vars = ','.join(filter(None, [input_vars, output_vars, trainable_vars, bram_vars]))
+        top_call = f'{model.config.get_project_name()}({all_vars});'
+
+        loss_expr = self._make_trainable_loss_log_expr(model)
+        result_logging = self._make_trainable_result_logging(model, '            ')
+        prediction_logging = self._make_trainable_prediction_logging(model, '                ')
+
+        fout.write(
+            f"""#include <algorithm>
+#include <fstream>
+#include <iostream>
+#include <map>
+#include <math.h>
+#include <numeric>
+#include <random>
+#include <sstream>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string>
+#include <vector>
+
+#include "firmware/{model.config.get_project_name()}.h"
+#include "firmware/nnet_utils/nnet_helpers.h"
+
+{bram_includes}
+#define CHECKPOINT 5000
+#define TRAINABLE_NUM_EPOCHS {epochs}
+#define TRAINABLE_SHUFFLE {shuffle}
+#define TRAINABLE_SHUFFLE_SEED {shuffle_seed}
+#define TRAINABLE_LOG_EVERY {log_every}
+
+namespace nnet {{
+bool trace_enabled = true;
+std::map<std::string, void *> *trace_outputs = NULL;
+size_t trace_type_size = sizeof(double);
+}} // namespace nnet
+
+struct TrainableSample {{
+    std::string input;
+    std::string target;
+}};
+
+static std::vector<float> parse_floats(const std::string &line) {{
+    std::vector<float> values;
+    std::istringstream stream(line);
+    float value;
+    while (stream >> value) {{
+        values.push_back(value);
+    }}
+    return values;
+}}
+
+int main(int argc, char **argv) {{
+{namespace_line}
+    std::ifstream fin("tb_data/tb_input_features.dat");
+    std::ifstream fpr("tb_data/tb_output_predictions.dat");
+
+#ifdef RTL_SIM
+    std::string RESULTS_LOG = "tb_data/rtl_cosim_results.log";
+#else
+    std::string RESULTS_LOG = "tb_data/csim_results.log";
+#endif
+    std::ofstream fout(RESULTS_LOG);
+    std::ofstream floss("tb_data/trainable_loss.log");
+    floss << "epoch step sample global_step loss alpha" << std::endl;
+
+    std::vector<TrainableSample> samples;
+    std::string iline;
+    std::string pline;
+    while (std::getline(fin, iline) && std::getline(fpr, pline)) {{
+        samples.push_back({{iline, pline}});
+    }}
+
+    if (!samples.empty()) {{
+        std::vector<unsigned> order(samples.size());
+        std::iota(order.begin(), order.end(), 0);
+        std::mt19937 rng(TRAINABLE_SHUFFLE_SEED);
+        unsigned long global_step = 0;
+
+        for (unsigned epoch = 0; epoch < TRAINABLE_NUM_EPOCHS; epoch++) {{
+            if (TRAINABLE_SHUFFLE) {{
+                std::shuffle(order.begin(), order.end(), rng);
+            }}
+
+            double epoch_loss = 0.0;
+            for (unsigned sample_step = 0; sample_step < order.size(); sample_step++) {{
+                const unsigned sample_index = order[sample_step];
+                std::vector<float> in = parse_floats(samples[sample_index].input);
+                std::vector<float> pr = parse_floats(samples[sample_index].target);
+
+{''.join(data_lines)}
+
+            {top_call}
+
+{result_logging}
+                const double step_loss = {loss_expr};
+                epoch_loss += step_loss;
+                floss << epoch << " " << sample_step << " " << sample_index << " "
+                      << global_step << " " << step_loss << " " << (double)trainable_alpha[0]
+                      << std::endl;
+
+                if (global_step % TRAINABLE_LOG_EVERY == 0) {{
+                    std::cout << "Trainable epoch " << epoch << ", sample " << sample_step
+                              << ", loss " << step_loss << ", alpha " << trainable_alpha[0]
+                              << std::endl;
+                    std::cout << "Quantized predictions" << std::endl;
+{prediction_logging}
+                }}
+                global_step++;
+            }}
+
+            std::cout << "Trainable epoch " << epoch << " average loss "
+                      << epoch_loss / samples.size() << std::endl;
+        }}
+    }} else {{
+        std::cout << "INFO: Unable to open input/predictions file, using default trainable input." << std::endl;
+        const unsigned NUM_TEST_SAMPLES = 5;
+        for (unsigned sample_step = 0; sample_step < NUM_TEST_SAMPLES; sample_step++) {{
+{''.join(zero_lines)}
+
+            {top_call}
+
+{result_logging}
+        }}
+    }}
+
+    fout.close();
+    floss.close();
+    std::cout << "INFO: Saved trainable inference results to file: " << RESULTS_LOG << std::endl;
+    std::cout << "INFO: Saved trainable loss trace to file: tb_data/trainable_loss.log" << std::endl;
+
+    return 0;
+}}
+"""
+        )
+        fout.close()
 
     def _make_trainable_bridge_defaults(self, model, indent):
         if not self._is_trainable_model(model):
@@ -1081,6 +1291,10 @@ struct {config_name} {{
                 self.__make_dat_file(
                     output_predictions, f'{model.config.get_output_dir()}/tb_data/tb_output_predictions.dat'
                 )
+
+        if self._is_trainable_model(model):
+            self._write_trainable_test_bench(model, filedir)
+            return
 
         f = open(os.path.join(filedir, '../templates/vivado/myproject_test.cpp'))
         fout = open(f'{model.config.get_output_dir()}/{model.config.get_project_name()}_test.cpp', 'w')

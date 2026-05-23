@@ -54,6 +54,11 @@ def test_training_config_defaults_to_inference():
 
     assert config.is_trainable() is False
     assert config.get_training_config()['BatchSize'] == 1
+    assert config.get_training_config()['BatchSizeLog2'] == 0
+    assert config.get_training_config()['Epochs'] == 1
+    assert config.get_training_config()['Shuffle'] is True
+    assert config.get_training_config()['ShuffleSeed'] == 13
+    assert config.get_training_config()['LogEvery'] == 1
     assert config.get_loss_config() == {'Kind': None}
     assert config.get_optimizer_config()['Kind'] == 'sgd'
     assert config.get_controller_config()['Kind'] == 'none'
@@ -65,6 +70,10 @@ def test_training_config_merges_model_schema_sections():
             {
                 'Trainable': True,
                 'BatchSize': 8,
+                'Epochs': 4,
+                'Shuffle': False,
+                'ShuffleSeed': 7,
+                'LogEvery': 2,
                 'Loss': {'Kind': 'half_mse', 'Output': 'output'},
                 'Optimizer': {'LearningRate': 0.01},
                 'Controller': {'Kind': 'ctrl_gt_order_0'},
@@ -75,6 +84,10 @@ def test_training_config_merges_model_schema_sections():
 
     assert config.is_trainable() is True
     assert config.get_training_config()['BatchSize'] == 8
+    assert config.get_training_config()['Epochs'] == 4
+    assert config.get_training_config()['Shuffle'] is False
+    assert config.get_training_config()['ShuffleSeed'] == 7
+    assert config.get_training_config()['LogEvery'] == 2
     assert config.get_loss_config() == {'Kind': 'half_mse', 'Output': 'output'}
     assert config.get_optimizer_config() == {'Kind': 'sgd', 'LearningRate': 0.01, 'LearningRateInput': None}
     assert config.get_controller_config()['Kind'] == 'ctrl_gt_order_0'
@@ -501,20 +514,30 @@ def test_vivado_writer_emits_trainable_configs_and_copies_headers(tmp_path):
 
     writer = VivadoWriter()
     trainable_configs = writer._make_trainable_configs(model)
+    dense_config_name = writer._trainable_dense_config_name(model.graph['dense'])
 
     assert 'struct trainable_loss_config0' in trainable_configs
     assert 'struct trainable_config' in trainable_configs
     assert 'static const unsigned batch_size_log2 = 0;' in trainable_configs
+    assert 'static constexpr double learning_rate = 0.01;' in trainable_configs
     assert 'typedef dense_loss_t loss_t;' in trainable_configs
     assert 'typedef dense_alpha_t learning_rate_t;' in trainable_configs
     assert any(port['name'] == 'dense_truth' for port in writer._make_trainable_top_level_ports(model))
     assert 'nnet::half_mse<trainable_loss_config0>' in writer._make_trainable_call_chain(model)
     assert 'nnet::dense_backpass<trainable_config' in writer._make_trainable_call_chain(model)
     assert 'nnet::sgd<trainable_config' in writer._make_trainable_call_chain(model)
+    assert f'{dense_config_name}::learning_rate_t({dense_config_name}::learning_rate)' in writer._make_trainable_call_chain(model)
     assert 'nnet::global_throttle_none<trainable_config' in writer._make_trainable_call_chain(model)
     assert 'nnet::apply_dense_update<trainable_config' in writer._make_trainable_call_chain(model)
     assert 'nnet::copy_data<float, result_t, 0, 1>(pr, dense_truth);' in writer._make_trainable_testbench_data(
         model, '    ', 'e'
+    )
+    internal_buffers = writer._make_trainable_internal_buffers(model)
+    assert 'dense_loss_grad_t dense_loss_grad[trainable_loss_config0::n_out];' in internal_buffers
+    assert f'dense_grad_out_t dense_grad_out[{dense_config_name}::n_in];' in internal_buffers
+    assert (
+        f'dense_weight_grad_accum[{dense_config_name}::n_in * {dense_config_name}::n_out];'
+        in internal_buffers
     )
     assert 'bool train_enable = false;' in writer._make_trainable_bridge_defaults(model, '    ')
 

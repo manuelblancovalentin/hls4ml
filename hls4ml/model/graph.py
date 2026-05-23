@@ -30,6 +30,11 @@ class HLSConfig(Serializable):
     _default_training_config = {
         'Trainable': False,
         'BatchSize': 1,
+        'BatchSizeLog2': 0,
+        'Epochs': 1,
+        'Shuffle': True,
+        'ShuffleSeed': 13,
+        'LogEvery': 1,
         'Loss': {'Kind': None},
         'Optimizer': {'Kind': 'sgd', 'LearningRate': None, 'LearningRateInput': None},
         'Controller': {'Kind': 'none', 'SafetyBudget': {'Enabled': False}},
