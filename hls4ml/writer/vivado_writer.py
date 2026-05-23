@@ -33,6 +33,14 @@ class VivadoWriter(Writer):
         return f'{owner_name}_{signal_name}'
 
     @staticmethod
+    def _trainable_dense_config_name(layer):
+        return f'trainable_config{layer.index}'
+
+    @staticmethod
+    def _trainable_layer_signal(layer, signal):
+        return f'{layer.name}_{signal}'
+
+    @staticmethod
     def _batch_size_log2(training_config):
         if training_config.get('BatchSizeLog2') is not None:
             return int(training_config['BatchSizeLog2'])
@@ -56,7 +64,7 @@ class VivadoWriter(Writer):
         loss_grad_t = self._trainable_type_name(
             output_layer, 'loss_grad_t', self._trainable_type_name(output_layer, 'grad_in_t', data_in_t)
         )
-        config_name = f'trainable_loss_config{endpoint["index"]}'
+        config_name = self._trainable_loss_config_name(endpoint)
 
         return f"""// Trainable loss endpoint {endpoint['index']}
 struct {config_name} {{
@@ -79,7 +87,7 @@ struct {config_name} {{
         output_type = layer.get_output_variable().type.name
         weight_type = layer.get_weights('weight').type.name
         bias_type = layer.get_weights('bias').type.name
-        config_name = f'trainable_config{layer.index}'
+        config_name = self._trainable_dense_config_name(layer)
         batch_size_log2 = self._batch_size_log2(training_config)
 
         return f"""// Trainable Dense state for {layer.name}
@@ -133,6 +141,69 @@ struct {config_name} {{
                 configs += self._make_trainable_dense_config(model, layer) + '\n'
 
         return configs
+
+    @staticmethod
+    def _trainable_loss_config_name(endpoint):
+        return f'trainable_loss_config{endpoint["index"]}'
+
+    def _trainable_loss_type_name(self, model, endpoint):
+        output_layer = model.graph[endpoint['loss_input_layer']]
+        return self._trainable_type_name(output_layer, 'loss_t', endpoint['loss_input_type'])
+
+    def _make_trainable_internal_buffers(self, model):
+        if not self._is_trainable_model(model):
+            return ''
+
+        lines = ['    // Trainable internal state and temporaries\n']
+
+        for endpoint in getattr(model, 'trainable_loss_endpoints', ()):
+            lines.append(
+                '    {type} {name}[1];\n'.format(
+                    type=self._trainable_loss_type_name(model, endpoint), name=endpoint['loss_scalar_name']
+                )
+            )
+            lines.append(
+                '    {type} {name}[{size}];\n'.format(
+                    type=endpoint['loss_gradient_type'],
+                    name=endpoint['loss_gradient_name'],
+                    size=endpoint['loss_input_size'],
+                )
+            )
+
+        if getattr(model, 'trainable_backward_order', ()):
+            first_layer = model.graph[model.trainable_backward_order[0]]
+            lines.append(
+                '    {type} trainable_alpha[1];\n'.format(
+                    type=self._trainable_type_name(first_layer, 'alpha_t')
+                )
+            )
+
+        for layer_name in getattr(model, 'trainable_backward_order', ()):
+            layer = model.graph[layer_name]
+            if layer.class_name != 'Dense':
+                continue
+
+            n_in = layer.get_attr('n_in')
+            n_out = layer.get_attr('n_out')
+            n_weights = n_in * n_out
+            prefix = layer.name
+
+            lines.append(f'    {self._trainable_type_name(layer, "grad_out_t")} {prefix}_grad_out[{n_in}];\n')
+            lines.append(
+                f'    static {self._trainable_type_name(layer, "gradient_accum_t")} '
+                f'{prefix}_weight_grad_accum[{n_weights}];\n'
+            )
+            lines.append(
+                f'    static {self._trainable_type_name(layer, "gradient_accum_t")} '
+                f'{prefix}_bias_grad_accum[{n_out}];\n'
+            )
+            lines.append(f'    {self._trainable_type_name(layer, "weight_grad_t")} {prefix}_weight_grad[{n_weights}];\n')
+            lines.append(f'    {self._trainable_type_name(layer, "bias_grad_t")} {prefix}_bias_grad[{n_out}];\n')
+            lines.append(f'    {self._trainable_type_name(layer, "raw_update_t")} {prefix}_weight_update[{n_weights}];\n')
+            lines.append(f'    {self._trainable_type_name(layer, "raw_update_t")} {prefix}_bias_update[{n_out}];\n')
+
+        lines.append('\n')
+        return ''.join(lines)
 
     def print_array_to_cpp(self, var, odir, namespace=None, write_txt_file=True):
         """Write a weights array to C++ header files.
@@ -360,6 +431,7 @@ struct {config_name} {{
                                 newline += '    ' + def_cpp + ';\n'
                                 if var.pragma:
                                     newline += '    ' + self._make_array_pragma(var) + '\n\n'
+                newline += self._make_trainable_internal_buffers(model)
                 for layer in model.get_layers():
                     func = layer.get_attr('function_cpp', None)
                     if func:
