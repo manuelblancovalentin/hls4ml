@@ -450,7 +450,7 @@ struct {config_name} {{
             return ''
 
         controller_kind = str(model.config.get_controller_config().get('Kind', 'none')).lower().replace('-', '_')
-        if controller_kind != 'none':
+        if controller_kind not in ['none', 'ctrl_none']:
             raise Exception(
                 'Trainable Vivado writer currently emits only CTRL-NONE. '
                 f'Controller {model.config.get_controller_config().get("Kind")} is not wired yet.'
