@@ -417,20 +417,6 @@ struct {config_name} {{
 
         return ' + '.join(f'(double){name}[0]' for name in loss_names)
 
-    def _make_trainable_weight_trace_header(self, model):
-        columns = ['epoch', 'sample', 'global_step', 'sample_index']
-        for layer_name in getattr(model, 'trainable_forward_order', ()):
-            layer = model.graph[layer_name]
-            if layer.class_name != 'Dense':
-                continue
-
-            n_weights = layer.get_attr('n_in') * layer.get_attr('n_out')
-            n_biases = layer.get_attr('n_out')
-            columns.extend(f'{layer.name}_weight_{index}' for index in range(n_weights))
-            columns.extend(f'{layer.name}_bias_{index}' for index in range(n_biases))
-
-        return ','.join(columns)
-
     def _make_trainable_weight_trace_declarations(self, model):
         lines = []
         for layer_name in getattr(model, 'trainable_forward_order', ()):
@@ -447,7 +433,55 @@ struct {config_name} {{
 
         return ''.join(lines)
 
-    def _make_trainable_weight_trace_values(self, model, indent):
+    @staticmethod
+    def _make_dense_weight_trace_header(layer):
+        columns = ['epoch', 'sample', 'global_step', 'sample_index']
+        for i in range(layer.get_attr('n_in')):
+            for j in range(layer.get_attr('n_out')):
+                columns.append(f'weight_{i}_{j}')
+        return ','.join(columns)
+
+    @staticmethod
+    def _make_dense_bias_trace_header(layer):
+        columns = ['epoch', 'sample', 'global_step', 'sample_index']
+        columns.extend(f'bias_{j}' for j in range(layer.get_attr('n_out')))
+        return ','.join(columns)
+
+    def _make_trainable_parameter_trace_setup(self, model, indent):
+        lines = []
+        for layer_name in getattr(model, 'trainable_forward_order', ()):
+            layer = model.graph[layer_name]
+            if layer.class_name != 'Dense':
+                continue
+
+            lines.append(indent + f'std::system("mkdir -p tb_data/training/{layer.name}");\n')
+        return ''.join(lines)
+
+    def _make_trainable_parameter_trace_streams(self, model, indent):
+        lines = []
+        for layer_name in getattr(model, 'trainable_forward_order', ()):
+            layer = model.graph[layer_name]
+            if layer.class_name != 'Dense':
+                continue
+
+            lines.append(indent + f'std::ofstream f_{layer.name}_weights("tb_data/training/{layer.name}/weights.dat");\n')
+            lines.append(indent + f'std::ofstream f_{layer.name}_biases("tb_data/training/{layer.name}/biases.dat");\n')
+        return ''.join(lines)
+
+    def _make_trainable_parameter_trace_headers(self, model, indent):
+        lines = []
+        for layer_name in getattr(model, 'trainable_forward_order', ()):
+            layer = model.graph[layer_name]
+            if layer.class_name != 'Dense':
+                continue
+
+            lines.append(indent + f'write_trainable_metadata(f_{layer.name}_weights, "{layer.name}/weights", run_datetime);\n')
+            lines.append(indent + f'f_{layer.name}_weights << "{self._make_dense_weight_trace_header(layer)}" << std::endl;\n')
+            lines.append(indent + f'write_trainable_metadata(f_{layer.name}_biases, "{layer.name}/biases", run_datetime);\n')
+            lines.append(indent + f'f_{layer.name}_biases << "{self._make_dense_bias_trace_header(layer)}" << std::endl;\n')
+        return ''.join(lines)
+
+    def _make_trainable_parameter_trace_values(self, model, indent):
         lines = []
         for layer_name in getattr(model, 'trainable_forward_order', ()):
             layer = model.graph[layer_name]
@@ -458,13 +492,47 @@ struct {config_name} {{
             biases = layer.get_weights('bias').name
             n_weights = layer.get_attr('n_in') * layer.get_attr('n_out')
             n_biases = layer.get_attr('n_out')
+            lines.append(indent + f'f_{layer.name}_weights << (epoch + 1) << "," << samples.size() << "," << epoch_global_step << ",-1";\n')
             lines.append(indent + f'for (unsigned i = 0; i < {n_weights}; i++) {{\n')
-            lines.append(indent + f'    fweights << "," << (double){weights}[i];\n')
+            lines.append(indent + f'    f_{layer.name}_weights << "," << (double){weights}[i];\n')
             lines.append(indent + '}\n')
+            lines.append(indent + f'f_{layer.name}_weights << std::endl;\n')
+            lines.append(indent + f'f_{layer.name}_biases << (epoch + 1) << "," << samples.size() << "," << epoch_global_step << ",-1";\n')
             lines.append(indent + f'for (unsigned i = 0; i < {n_biases}; i++) {{\n')
-            lines.append(indent + f'    fweights << "," << (double){biases}[i];\n')
+            lines.append(indent + f'    f_{layer.name}_biases << "," << (double){biases}[i];\n')
             lines.append(indent + '}\n')
+            lines.append(indent + f'f_{layer.name}_biases << std::endl;\n')
 
+        return ''.join(lines)
+
+    def _make_trainable_parameter_trace_closes(self, model, indent):
+        lines = []
+        for layer_name in getattr(model, 'trainable_forward_order', ()):
+            layer = model.graph[layer_name]
+            if layer.class_name != 'Dense':
+                continue
+
+            lines.append(indent + f'f_{layer.name}_weights.close();\n')
+            lines.append(indent + f'f_{layer.name}_biases.close();\n')
+        return ''.join(lines)
+
+    def _make_trainable_parameter_trace_logs(self, model, indent):
+        lines = []
+        for layer_name in getattr(model, 'trainable_forward_order', ()):
+            layer = model.graph[layer_name]
+            if layer.class_name != 'Dense':
+                continue
+
+            lines.append(
+                indent
+                + f'std::cout << "INFO: Saved trainable {layer.name} weight trace to file: '
+                + f'tb_data/training/{layer.name}/weights.dat" << std::endl;\n'
+            )
+            lines.append(
+                indent
+                + f'std::cout << "INFO: Saved trainable {layer.name} bias trace to file: '
+                + f'tb_data/training/{layer.name}/biases.dat" << std::endl;\n'
+            )
         return ''.join(lines)
 
     def _make_trainable_result_logging(self, model, indent):
@@ -533,9 +601,13 @@ struct {config_name} {{
 
         loss_expr = self._make_trainable_loss_log_expr(model)
         result_logging = self._make_trainable_result_logging(model, '            ')
-        weight_trace_header = self._make_trainable_weight_trace_header(model)
         weight_trace_declarations = self._make_trainable_weight_trace_declarations(model)
-        weight_trace_values = self._make_trainable_weight_trace_values(model, '            ')
+        parameter_trace_setup = self._make_trainable_parameter_trace_setup(model, '    ')
+        parameter_trace_streams = self._make_trainable_parameter_trace_streams(model, '    ')
+        parameter_trace_headers = self._make_trainable_parameter_trace_headers(model, '    ')
+        parameter_trace_values = self._make_trainable_parameter_trace_values(model, '            ')
+        parameter_trace_closes = self._make_trainable_parameter_trace_closes(model, '    ')
+        parameter_trace_logs = self._make_trainable_parameter_trace_logs(model, '    ')
 
         fout.write(
             f"""#include <algorithm>
@@ -625,6 +697,7 @@ int main(int argc, char **argv) {{
 {namespace_line}
     const std::string run_datetime = current_datetime();
 
+{parameter_trace_setup}
     std::ifstream fin("tb_data/tb_input_features.dat");
     std::ifstream fpr("tb_data/tb_output_predictions.dat");
 
@@ -636,13 +709,12 @@ int main(int argc, char **argv) {{
     std::ofstream fout(RESULTS_LOG);
     std::ofstream floss("tb_data/training/loss.dat");
     std::ofstream falpha("tb_data/training/alpha.dat");
-    std::ofstream fweights("tb_data/training/weights.dat");
+{parameter_trace_streams}
     write_trainable_metadata(floss, "loss", run_datetime);
     floss << "epoch,sample,global_step,sample_index,loss" << std::endl;
     write_trainable_metadata(falpha, "alpha", run_datetime);
     falpha << "epoch,sample,global_step,sample_index,alpha" << std::endl;
-    write_trainable_metadata(fweights, "weights", run_datetime);
-    fweights << "{weight_trace_header}" << std::endl;
+{parameter_trace_headers}
 
     std::cout << "============================================================" << std::endl;
     std::cout << "ENABOL + hls4ml-trainable CSIM training run" << std::endl;
@@ -706,8 +778,7 @@ int main(int argc, char **argv) {{
             std::cout << "Trainable epoch " << epoch << " average loss "
                       << epoch_loss / samples.size() << std::endl;
             const long epoch_global_step = global_step == 0 ? 0 : (long)global_step - 1;
-            fweights << (epoch + 1) << "," << samples.size() << "," << epoch_global_step << ",-1";
-{weight_trace_values}            fweights << std::endl;
+{parameter_trace_values}
         }}
     }} else {{
         std::cout << "INFO: Unable to open input/predictions file, using default trainable input." << std::endl;
@@ -724,11 +795,11 @@ int main(int argc, char **argv) {{
     fout.close();
     floss.close();
     falpha.close();
-    fweights.close();
+{parameter_trace_closes}
     std::cout << "INFO: Saved trainable inference results to file: " << RESULTS_LOG << std::endl;
     std::cout << "INFO: Saved trainable loss trace to file: tb_data/training/loss.dat" << std::endl;
     std::cout << "INFO: Saved trainable alpha trace to file: tb_data/training/alpha.dat" << std::endl;
-    std::cout << "INFO: Saved trainable weights trace to file: tb_data/training/weights.dat" << std::endl;
+{parameter_trace_logs}
 
     return 0;
 }}
