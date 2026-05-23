@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from hls4ml.backends import get_backend
+from hls4ml.writer.vivado_writer import VivadoWriter
 from hls4ml.model.flow import get_flow
 from hls4ml.model.graph import HLSConfig, ModelGraph
 from hls4ml.model.optimizer import get_optimizer
@@ -18,6 +19,11 @@ TRAINABLE_PRECISION = {
     'optimizer_state': 'ap_fixed<20,6>',
     'controller_metric': 'ap_fixed<32,16>',
     'alpha': 'ap_fixed<16,4>',
+}
+TRAINABLE_WRITER_PRECISION = {
+    **TRAINABLE_PRECISION,
+    'loss': 'ap_fixed<32,16>',
+    'loss_grad': 'ap_fixed<18,8>',
 }
 
 
@@ -459,3 +465,51 @@ def test_vivado_trainable_loss_endpoint_rejects_unknown_output_mapping():
 
     with pytest.raises(Exception, match='not one of the model outputs'):
         get_optimizer('vivado:resolve_trainable_loss_endpoints').transform(model)
+
+
+def test_vivado_writer_emits_trainable_configs_and_copies_headers(tmp_path):
+    layers = [
+        {'class_name': 'Input', 'name': 'input_layer', 'input_shape': [1]},
+        {
+            'class_name': 'Dense',
+            'name': 'dense',
+            'n_in': 1,
+            'n_out': 1,
+            'weight_data': np.array([[1.0]]),
+            'bias_data': np.array([0.0]),
+        },
+    ]
+    config = make_config(
+        {
+            'Trainable': True,
+            'BatchSize': 1,
+            'BatchSizeLog2': 0,
+            'Loss': {'Kind': 'half_mse'},
+            'Optimizer': {'Kind': 'sgd', 'LearningRate': 0.01},
+            'Controller': {'Kind': 'none'},
+            'Precision': TRAINABLE_WRITER_PRECISION,
+        }
+    )
+    config['OutputDir'] = str(tmp_path)
+    config['HLSConfig']['LayerName'] = {'input_layer': {'Training': {'Trainable': False}}}
+    config['HLSConfig']['Flows'] = []
+    model = ModelGraph.from_layer_list(config, layers)
+
+    get_optimizer('vivado:validate_trainable_config').transform(model)
+    get_optimizer('vivado:resolve_trainable_backward_order').transform(model)
+    get_optimizer('vivado:resolve_trainable_loss_endpoints').transform(model)
+
+    writer = VivadoWriter()
+    trainable_configs = writer._make_trainable_configs(model)
+
+    assert 'struct trainable_loss_config0' in trainable_configs
+    assert 'struct trainable_config' in trainable_configs
+    assert 'static const unsigned batch_size_log2 = 0;' in trainable_configs
+    assert 'typedef dense_loss_t loss_t;' in trainable_configs
+    assert 'typedef dense_alpha_t learning_rate_t;' in trainable_configs
+
+    (tmp_path / 'firmware').mkdir()
+    writer.write_trainable_utils(model)
+
+    assert (tmp_path / 'firmware' / 'trainable' / 'backprop' / 'nnet_dense_backprop.h').exists()
+    assert (tmp_path / 'firmware' / 'trainable' / 'losses' / 'mse.h').exists()

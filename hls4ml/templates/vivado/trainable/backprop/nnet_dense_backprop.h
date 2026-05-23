@@ -6,6 +6,16 @@
 
 namespace nnet {
 
+    // Dense backward pass for the first trainable path.
+    //
+    // This kernel is intentionally split from weight application. It computes:
+    //   - grad_out: dL/dx for the previous layer,
+    //   - weight_grad_accum and bias_grad_accum: running batch sums,
+    //   - weight_grad and bias_grad: averaged gradients at batch_end.
+    //
+    // The update itself is handled later by the optimizer/controller path so a
+    // global alpha can throttle every parameter update without changing the
+    // layer-local gradient direction.
     template<typename CONFIG_T>
     void dense_backpass(
         const typename CONFIG_T::data_in_t data_in[CONFIG_T::n_in],
@@ -33,6 +43,8 @@ namespace nnet {
         using bias_grad_t = typename CONFIG_T::bias_grad_t;
         using grad_out_t = typename CONFIG_T::grad_out_t;
 
+        // reset_accumulators is asserted at the first sample of a batch. This
+        // lets one static accumulator buffer collect gradients across the batch.
         if (reset_accumulators) {
             ResetWeightAccumulators:
             for (unsigned i = 0; i < n_weights; i++) {
@@ -80,6 +92,8 @@ namespace nnet {
             bias_grad_accum[j] += accum_t(grad_in[j]);
         }
 
+        // batch_size_log2 comes from ENABOL/hls4ml config. We require power-of-2
+        // batches so averaging can be emitted as a shift instead of a divider.
         if (batch_end) {
             const ap_uint<16> batch_shift = CONFIG_T::batch_size_log2;
 
@@ -100,6 +114,10 @@ namespace nnet {
             }
         }
 
+        // These trace calls are no-ops unless the generated firmware is compiled
+        // with HLS4ML_TRAINABLE_TRACE, which should only happen when hls4ml trace
+        // collection is enabled. The CONFIG_T trace names will be emitted by the
+        // writer when we wire trainable tracing into parameters.h/bridge storage.
         HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_data_in_name, data_in, n_in);
         HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_grad_in_name, grad_in, n_out);
         HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_grad_out_name, grad_out, n_in);

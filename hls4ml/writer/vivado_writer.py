@@ -15,6 +15,125 @@ config_filename = 'hls4ml_config.yml'
 
 
 class VivadoWriter(Writer):
+    @staticmethod
+    def _is_trainable_model(model):
+        return hasattr(model.config, 'is_trainable') and model.config.is_trainable()
+
+    @staticmethod
+    def _trainable_type_name(layer, attr_name, default_type_name=None):
+        type_attr = layer.get_attr(attr_name, None)
+        if type_attr is not None:
+            return type_attr.name
+        if default_type_name is not None:
+            return default_type_name
+        raise Exception(f'Trainable layer {layer.name} is missing required type attribute {attr_name}.')
+
+    @staticmethod
+    def _trainable_trace_name(owner_name, signal_name):
+        return f'{owner_name}_{signal_name}'
+
+    @staticmethod
+    def _batch_size_log2(training_config):
+        if training_config.get('BatchSizeLog2') is not None:
+            return int(training_config['BatchSizeLog2'])
+
+        batch_size = int(training_config.get('BatchSize', 1))
+        if batch_size < 1 or batch_size & (batch_size - 1):
+            raise Exception(
+                'Trainable hls4ml requires a power-of-two BatchSize or an explicit BatchSizeLog2 '
+                f'for firmware generation, got BatchSize={batch_size}.'
+            )
+
+        return batch_size.bit_length() - 1
+
+    def _make_trainable_loss_config(self, model, endpoint):
+        output_layer = model.graph[endpoint['loss_input_layer']]
+        output_variable = model.get_layer_output_variable(endpoint['loss_input_name'])
+        data_in_t = output_variable.type.name
+        ground_truth_t = output_layer.get_attr('ground_truth_t', None)
+        ground_truth_t = ground_truth_t.name if ground_truth_t is not None else data_in_t
+        loss_t = self._trainable_type_name(output_layer, 'loss_t', data_in_t)
+        loss_grad_t = self._trainable_type_name(
+            output_layer, 'loss_grad_t', self._trainable_type_name(output_layer, 'grad_in_t', data_in_t)
+        )
+        config_name = f'trainable_loss_config{endpoint["index"]}'
+
+        return f"""// Trainable loss endpoint {endpoint['index']}
+struct {config_name} {{
+    static const unsigned n_out = {endpoint['loss_input_size']};
+    typedef {data_in_t} data_in_t;
+    typedef {ground_truth_t} ground_truth_t;
+    typedef {loss_t} loss_t;
+    typedef {loss_grad_t} grad_out_t;
+#if !defined(__SYNTHESIS__) && defined(HLS4ML_TRAINABLE_TRACE)
+    static constexpr const char *trace_prediction_name = "{self._trainable_trace_name(endpoint['loss_input_name'], 'prediction')}";
+    static constexpr const char *trace_ground_truth_name = "{self._trainable_trace_name(endpoint['ground_truth_name'], 'ground_truth')}";
+    static constexpr const char *trace_loss_name = "{endpoint['loss_scalar_name']}";
+    static constexpr const char *trace_loss_grad_name = "{endpoint['loss_gradient_name']}";
+#endif
+}};\n"""
+
+    def _make_trainable_dense_config(self, model, layer):
+        training_config = model.config.get_training_config()
+        input_type = layer.get_input_variable().type.name
+        output_type = layer.get_output_variable().type.name
+        weight_type = layer.get_weights('weight').type.name
+        bias_type = layer.get_weights('bias').type.name
+        config_name = f'trainable_config{layer.index}'
+        batch_size_log2 = self._batch_size_log2(training_config)
+
+        return f"""// Trainable Dense state for {layer.name}
+struct {config_name} {{
+    static const unsigned n_in = {layer.get_attr('n_in')};
+    static const unsigned n_out = {layer.get_attr('n_out')};
+    static const unsigned batch_size_log2 = {batch_size_log2};
+    typedef {input_type} data_in_t;
+    typedef {output_type} data_out_t;
+    typedef {weight_type} weight_t;
+    typedef {bias_type} bias_t;
+    typedef {self._trainable_type_name(layer, 'grad_in_t', output_type)} grad_in_t;
+    typedef {self._trainable_type_name(layer, 'grad_out_t', input_type)} grad_out_t;
+    typedef {self._trainable_type_name(layer, 'weight_grad_t')} weight_grad_t;
+    typedef {self._trainable_type_name(layer, 'bias_grad_t')} bias_grad_t;
+    typedef {self._trainable_type_name(layer, 'gradient_accum_t')} gradient_accum_t;
+    typedef {self._trainable_type_name(layer, 'raw_update_t')} raw_update_t;
+    typedef {self._trainable_type_name(layer, 'update_t')} update_t;
+    typedef {self._trainable_type_name(layer, 'optimizer_state_t')} optimizer_state_t;
+    typedef {self._trainable_type_name(layer, 'controller_metric_t')} controller_metric_t;
+    typedef {self._trainable_type_name(layer, 'alpha_t')} alpha_t;
+    typedef {self._trainable_type_name(layer, 'learning_rate_t', self._trainable_type_name(layer, 'alpha_t'))} learning_rate_t;
+#if !defined(__SYNTHESIS__) && defined(HLS4ML_TRAINABLE_TRACE)
+    static constexpr const char *trace_data_in_name = "{self._trainable_trace_name(layer.name, 'backprop_data_in')}";
+    static constexpr const char *trace_grad_in_name = "{self._trainable_trace_name(layer.name, 'backprop_grad_in')}";
+    static constexpr const char *trace_grad_out_name = "{self._trainable_trace_name(layer.name, 'backprop_grad_out')}";
+    static constexpr const char *trace_weight_grad_accum_name = "{self._trainable_trace_name(layer.name, 'weight_grad_accum')}";
+    static constexpr const char *trace_bias_grad_accum_name = "{self._trainable_trace_name(layer.name, 'bias_grad_accum')}";
+    static constexpr const char *trace_weight_grad_name = "{self._trainable_trace_name(layer.name, 'weight_grad')}";
+    static constexpr const char *trace_bias_grad_name = "{self._trainable_trace_name(layer.name, 'bias_grad')}";
+    static constexpr const char *trace_weight_update_name = "{self._trainable_trace_name(layer.name, 'weight_update')}";
+    static constexpr const char *trace_bias_update_name = "{self._trainable_trace_name(layer.name, 'bias_update')}";
+    static constexpr const char *trace_alpha_name = "{self._trainable_trace_name(layer.name, 'alpha')}";
+    static constexpr const char *trace_weights_after_update_name = "{self._trainable_trace_name(layer.name, 'weights_after_update')}";
+    static constexpr const char *trace_biases_after_update_name = "{self._trainable_trace_name(layer.name, 'biases_after_update')}";
+#endif
+}};\n"""
+
+    def _make_trainable_configs(self, model):
+        if not self._is_trainable_model(model):
+            return ''
+
+        configs = '\n// Trainable firmware configuration\n'
+
+        for endpoint in getattr(model, 'trainable_loss_endpoints', ()):
+            configs += self._make_trainable_loss_config(model, endpoint) + '\n'
+
+        for layer_name in getattr(model, 'trainable_backward_order', ()):
+            layer = model.graph[layer_name]
+            if layer.class_name == 'Dense':
+                configs += self._make_trainable_dense_config(model, layer) + '\n'
+
+        return configs
+
     def print_array_to_cpp(self, var, odir, namespace=None, write_txt_file=True):
         """Write a weights array to C++ header files.
 
@@ -447,6 +566,11 @@ class VivadoWriter(Writer):
                 newline = line
                 for include in sorted(set(sum((layer.get_attr('include_header', []) for layer in model.get_layers()), []))):
                     newline += '#include "%s"\n' % include
+                if self._is_trainable_model(model):
+                    newline += '#include "trainable/backprop/nnet_dense_backprop.h"\n'
+                    newline += '#include "trainable/controllers/global_throttle.h"\n'
+                    newline += '#include "trainable/losses/mse.h"\n'
+                    newline += '#include "trainable/optimizers/sgd.h"\n'
 
             elif '// hls-fpga-machine-learning insert weights' in line:
                 newline = line
@@ -462,6 +586,7 @@ class VivadoWriter(Writer):
                     if config:
                         newline += '// ' + layer.name + '\n'
                         newline += config + '\n'
+                newline += self._make_trainable_configs(model)
 
             elif '// hls-fpga-machine-learning insert namespace-start' in line:
                 newline = ''
@@ -1054,6 +1179,21 @@ class VivadoWriter(Writer):
         for dst, srcpath in custom_source.items():
             dstpath = f'{model.config.get_output_dir()}/firmware/{dst}'
             copyfile(srcpath, dstpath)
+
+        if self._is_trainable_model(model):
+            self.write_trainable_utils(model)
+
+    def write_trainable_utils(self, model):
+        """Copy trainable static headers into the generated firmware directory."""
+
+        filedir = os.path.dirname(os.path.abspath(__file__))
+        srcpath = os.path.join(filedir, '../templates/vivado/trainable/')
+        dstpath = f'{model.config.get_output_dir()}/firmware/trainable/'
+
+        if os.path.exists(dstpath):
+            rmtree(dstpath)
+
+        copytree(srcpath, dstpath)
 
     def write_generated_code(self, model):
         """Write the generated code (nnet_code_gen.h)

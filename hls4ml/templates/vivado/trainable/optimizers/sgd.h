@@ -5,6 +5,11 @@
 
 namespace nnet {
 
+    // Basic SGD proposal stage.
+    //
+    // This does not directly mutate weights. It only computes the raw update
+    // direction, -learning_rate * gradient. The controller/update stage applies
+    // an alpha-scaled version of this proposal after global throttling is known.
     template<typename CONFIG_T>
     void sgd(
         const typename CONFIG_T::weight_grad_t weight_grad[CONFIG_T::n_in * CONFIG_T::n_out],
@@ -19,6 +24,9 @@ namespace nnet {
 
         using raw_update_t = typename CONFIG_T::raw_update_t;
 
+        // Weight and bias updates are emitted separately because hls4ml stores
+        // them as separate arrays, but both are part of the same global update
+        // vector from the controller's point of view.
         WeightUpdateProposal:
         for (unsigned i = 0; i < n_weights; i++) {
             #pragma HLS PIPELINE II=1
@@ -31,6 +39,7 @@ namespace nnet {
             bias_update[i] = raw_update_t(-learning_rate * bias_grad[i]);
         }
 
+        // Inactive unless HLS4ML_TRAINABLE_TRACE is defined by generated code.
         HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_weight_update_name, weight_update, n_weights);
         HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_bias_update_name, bias_update, n_out);
 
