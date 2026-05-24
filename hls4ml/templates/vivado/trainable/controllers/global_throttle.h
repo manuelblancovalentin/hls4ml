@@ -407,7 +407,6 @@ namespace nnet {
 
         metric_t alpha_next = alpha_state + k_alpha * (alpha_feasible - alpha_state);
 
-        metric_t alpha_min = metric_t(CONFIG_T::controller_alpha_min);
         metric_t alpha_max = metric_t(CONFIG_T::controller_alpha_max);
 
         if (alpha_next < alpha_min) {
