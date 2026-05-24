@@ -135,10 +135,18 @@ namespace nnet {
     } // global_throttle_none
 
 
-    // CTRL-GT-ORDER-0: algebraic safe-gain global throttle.
+    // CTRL-GT-ORDER-0: division-free binary-search global throttle.
     //
-    //  C = ||ΔG|| / (||Δθ|| + ε)
-    //  α = clip(χ / (η·C + ε),  α_min,  α_max)
+    //  Replaces the algebraic safe-gain law α = χ / (η·C + ε) with an
+    //  inequality comparison search over a table of binary-fraction alpha
+    //  candidates.  No division, no sqrt — CSIM-safe with ap_fixed types.
+    //
+    //  Constraint (from the stability inequality η·α·C ≤ χ):
+    //
+    //      α² · η² · ||ΔG||²  ≤  χ² · (||Δθ||² + ε²)
+    //
+    //  Candidates are evaluated in descending order; the first (largest) alpha
+    //  satisfying the inequality is selected.  If none satisfy, α = α_min.
     //
     //  State: none.  Curvature is recomputed fresh each batch_end from the
     //  global squared norms passed in.
@@ -153,50 +161,64 @@ namespace nnet {
         using metric_t = typename CONFIG_T::controller_metric_t;
 
         if (reset_numerator) {
-            // No curvature estimate available yet — stay at full step.
             alpha[0] = typename CONFIG_T::alpha_t(1);
-        } else {
-            metric_t eps = metric_t(CONFIG_T::controller_epsilon);
-
-            // ||Δθ||, ||ΔG|| via double sqrt (CSIM path; synthesis needs hls::sqrt)
-            metric_t dtheta_norm = metric_t(std::sqrt(double(dtheta_sq)));
-            metric_t dgrad_norm = metric_t(std::sqrt(double(dgrad_sq)));
-
-            // C = ||ΔG|| / (||Δθ|| + ε)
-            metric_t curvature = dgrad_norm / (dtheta_norm + eps);
-
-            // α = clip(χ / (η·C + ε),  α_min,  α_max)
-            metric_t chi = metric_t(CONFIG_T::controller_chi);
-            metric_t lr = metric_t(CONFIG_T::learning_rate);
-            metric_t alpha_raw = chi / (lr * curvature + eps);
-
-            metric_t alpha_min = metric_t(CONFIG_T::controller_alpha_min);
-            metric_t alpha_max = metric_t(CONFIG_T::controller_alpha_max);
-
-            if (alpha_raw < alpha_min) {
-                alpha[0] = typename CONFIG_T::alpha_t(alpha_min);
-            } else if (alpha_raw > alpha_max) {
-                alpha[0] = typename CONFIG_T::alpha_t(alpha_max);
-            } else {
-                alpha[0] = typename CONFIG_T::alpha_t(alpha_raw);
-            }
-
-            // Trace controller diagnostics (CSIM only when HLS4ML_TRAINABLE_TRACE defined).
-            HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_curvature_name, &curvature, 1);
-            HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_dtheta_norm_name, &dtheta_norm, 1);
-            HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_dgrad_norm_name, &dgrad_norm, 1);
+            HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_alpha_name, alpha, 1);
+            return;
         }
 
+        metric_t lr(CONFIG_T::learning_rate);
+        metric_t chi(CONFIG_T::controller_chi);
+        metric_t eps(CONFIG_T::controller_epsilon);
+        metric_t lr_sq = lr * lr;
+        metric_t chi_sq = chi * chi;
+        metric_t eps_sq = eps * eps;
+
+        metric_t rhs = chi_sq * (dtheta_sq + eps_sq);
+        metric_t lhs_base = lr_sq * dgrad_sq;
+
+        static const metric_t cand_val[11] = {
+            metric_t(1.000000),  metric_t(0.875000),  metric_t(0.750000),
+            metric_t(0.625000),  metric_t(0.500000),  metric_t(0.375000),
+            metric_t(0.250000),  metric_t(0.187500),  metric_t(0.125000),
+            metric_t(0.062500),  metric_t(0.031250),
+        };
+        static const metric_t cand_sq[11] = {
+            metric_t(1.000000),  metric_t(0.765625),  metric_t(0.562500),
+            metric_t(0.390625),  metric_t(0.250000),  metric_t(0.140625),
+            metric_t(0.062500),  metric_t(0.035156),  metric_t(0.015625),
+            metric_t(0.003906),  metric_t(0.000977),
+        };
+        static const unsigned n_candidates = 11;
+
+        alpha[0] = typename CONFIG_T::alpha_t(CONFIG_T::controller_alpha_min);
+
+        for (unsigned i = 0; i < n_candidates; i++) {
+            #pragma HLS UNROLL
+            metric_t lhs = cand_sq[i] * lhs_base;
+            if (lhs <= rhs) {
+                alpha[0] = typename CONFIG_T::alpha_t(cand_val[i]);
+                break;
+            }
+        }
+
+        HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_dgrad_sq_name, &dgrad_sq, 1);
+        HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_dtheta_sq_name, &dtheta_sq, 1);
+        HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_lhs_sq_name, &lhs_base, 1);
+        HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_rhs_sq_name, &rhs, 1);
         HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_alpha_name, alpha, 1);
 
     } // global_throttle_order0_law
 
 
-    // CTRL-GT-ORDER-1: first-order alpha-state global throttle.
+    // CTRL-GT-ORDER-1: division-free first-order alpha-state global throttle.
     //
-    //  C = ||ΔG|| / (||Δθ|| + ε)
-    //  m = χ - η·α·C
-    //  α ← clip(α + k_α·m,  α_min,  α_max)
+    //  Same inequality search as GT-0, but alpha_state evolves smoothly toward
+    //  the feasible candidate via a first-order attractor:
+    //
+    //      alpha_feasible = largest candidate satisfying  α²·η²·||ΔG||² ≤ χ²·(||Δθ||² + ε²)
+    //      α ← clip(α + k_α·(alpha_feasible - α),  α_min,  α_max)
+    //
+    //  No division, no sqrt — CSIM-safe with ap_fixed types.
     //
     //  State: α_state (persistent scalar).
     template<typename CONFIG_T>
@@ -213,43 +235,67 @@ namespace nnet {
         if (reset_numerator) {
             alpha_state = metric_t(1);
             alpha[0] = typename CONFIG_T::alpha_t(1);
-        } else {
-            metric_t eps = metric_t(CONFIG_T::controller_epsilon);
-
-            metric_t dtheta_norm = metric_t(std::sqrt(double(dtheta_sq)));
-            metric_t dgrad_norm = metric_t(std::sqrt(double(dgrad_sq)));
-
-            // C = ||ΔG|| / (||Δθ|| + ε)
-            metric_t curvature = dgrad_norm / (dtheta_norm + eps);
-
-            // m = χ - η·α·C
-            metric_t chi = metric_t(CONFIG_T::controller_chi);
-            metric_t lr = metric_t(CONFIG_T::learning_rate);
-            metric_t k_alpha = metric_t(CONFIG_T::controller_k_alpha);
-            metric_t margin = chi - lr * alpha_state * curvature;
-
-            // α ← clip(α + k_α·m,  α_min,  α_max)
-            metric_t alpha_next = alpha_state + k_alpha * margin;
-
-            metric_t alpha_min = metric_t(CONFIG_T::controller_alpha_min);
-            metric_t alpha_max = metric_t(CONFIG_T::controller_alpha_max);
-
-            if (alpha_next < alpha_min) {
-                alpha_state = alpha_min;
-            } else if (alpha_next > alpha_max) {
-                alpha_state = alpha_max;
-            } else {
-                alpha_state = alpha_next;
-            }
-
-            alpha[0] = typename CONFIG_T::alpha_t(alpha_state);
-
-            // Trace controller diagnostics.
-            HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_curvature_name, &curvature, 1);
-            HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_dtheta_norm_name, &dtheta_norm, 1);
-            HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_dgrad_norm_name, &dgrad_norm, 1);
-            HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_alpha_state_name, &alpha_state, 1);
+            HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_alpha_name, alpha, 1);
+            return;
         }
+
+        metric_t lr(CONFIG_T::learning_rate);
+        metric_t chi(CONFIG_T::controller_chi);
+        metric_t eps(CONFIG_T::controller_epsilon);
+        metric_t k_alpha(CONFIG_T::controller_k_alpha);
+        metric_t lr_sq = lr * lr;
+        metric_t chi_sq = chi * chi;
+        metric_t eps_sq = eps * eps;
+
+        metric_t rhs = chi_sq * (dtheta_sq + eps_sq);
+        metric_t lhs_base = lr_sq * dgrad_sq;
+
+        static const metric_t cand_val[11] = {
+            metric_t(1.000000),  metric_t(0.875000),  metric_t(0.750000),
+            metric_t(0.625000),  metric_t(0.500000),  metric_t(0.375000),
+            metric_t(0.250000),  metric_t(0.187500),  metric_t(0.125000),
+            metric_t(0.062500),  metric_t(0.031250),
+        };
+        static const metric_t cand_sq[11] = {
+            metric_t(1.000000),  metric_t(0.765625),  metric_t(0.562500),
+            metric_t(0.390625),  metric_t(0.250000),  metric_t(0.140625),
+            metric_t(0.062500),  metric_t(0.035156),  metric_t(0.015625),
+            metric_t(0.003906),  metric_t(0.000977),
+        };
+        static const unsigned n_candidates = 11;
+
+        metric_t alpha_feasible = metric_t(CONFIG_T::controller_alpha_min);
+        for (unsigned i = 0; i < n_candidates; i++) {
+            #pragma HLS UNROLL
+            metric_t lhs = cand_sq[i] * lhs_base;
+            if (lhs <= rhs) {
+                alpha_feasible = cand_val[i];
+                break;
+            }
+        }
+
+        metric_t alpha_next = alpha_state + k_alpha * (alpha_feasible - alpha_state);
+
+        metric_t alpha_min = metric_t(CONFIG_T::controller_alpha_min);
+        metric_t alpha_max = metric_t(CONFIG_T::controller_alpha_max);
+
+        if (alpha_next < alpha_min) {
+            alpha_state = alpha_min;
+        } else if (alpha_next > alpha_max) {
+            alpha_state = alpha_max;
+        } else {
+            alpha_state = alpha_next;
+        }
+
+        alpha[0] = typename CONFIG_T::alpha_t(alpha_state);
+
+        HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_dgrad_sq_name, &dgrad_sq, 1);
+        HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_dtheta_sq_name, &dtheta_sq, 1);
+        HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_alpha_feasible_name, &alpha_feasible, 1);
+        HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_alpha_state_name, &alpha_state, 1);
+        HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_alpha_name, alpha, 1);
+
+    } // global_throttle_order1_law
 
         HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_alpha_name, alpha, 1);
 

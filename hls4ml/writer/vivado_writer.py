@@ -149,6 +149,11 @@ struct {config_name} {{
     static constexpr const char *trace_dtheta_norm_name = "{self._trainable_trace_name(layer.name, 'dtheta_norm')}";
     static constexpr const char *trace_dgrad_norm_name = "{self._trainable_trace_name(layer.name, 'dgrad_norm')}";
     static constexpr const char *trace_alpha_state_name = "{self._trainable_trace_name(layer.name, 'alpha_state')}";
+    static constexpr const char *trace_alpha_feasible_name = "{self._trainable_trace_name(layer.name, 'alpha_feasible')}";
+    static constexpr const char *trace_dgrad_sq_name = "{self._trainable_trace_name(layer.name, 'dgrad_sq')}";
+    static constexpr const char *trace_dtheta_sq_name = "{self._trainable_trace_name(layer.name, 'dtheta_sq')}";
+    static constexpr const char *trace_lhs_sq_name = "{self._trainable_trace_name(layer.name, 'lhs_sq')}";
+    static constexpr const char *trace_rhs_sq_name = "{self._trainable_trace_name(layer.name, 'rhs_sq')}";
     static constexpr const char *trace_weights_after_update_name = "{self._trainable_trace_name(layer.name, 'weights_after_update')}";
     static constexpr const char *trace_biases_after_update_name = "{self._trainable_trace_name(layer.name, 'biases_after_update')}";
 #endif
