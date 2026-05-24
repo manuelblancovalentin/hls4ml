@@ -133,6 +133,24 @@ namespace nnet {
     } // global_throttle_none
 
 
+    template<typename CONFIG_T>
+    void reset_controller_metrics(
+        typename CONFIG_T::controller_metric_t dtheta_sq[1],
+        typename CONFIG_T::controller_metric_t dgrad_sq[1],
+        typename CONFIG_T::controller_metric_t lhs_sq[1],
+        typename CONFIG_T::controller_metric_t rhs_sq[1],
+        typename CONFIG_T::controller_metric_t alpha_feasible[1],
+        typename CONFIG_T::controller_metric_t alpha_state[1]
+    ) {
+        dtheta_sq[0] = typename CONFIG_T::controller_metric_t(0);
+        dgrad_sq[0] = typename CONFIG_T::controller_metric_t(0);
+        lhs_sq[0] = typename CONFIG_T::controller_metric_t(0);
+        rhs_sq[0] = typename CONFIG_T::controller_metric_t(0);
+        alpha_feasible[0] = typename CONFIG_T::controller_metric_t(1);
+        alpha_state[0] = typename CONFIG_T::controller_metric_t(1);
+    }
+
+
     // CTRL-GT-ORDER-0: division-free binary-search global throttle.
     //
     //  Replaces the algebraic safe-gain law α = χ / (η·C + ε) with an
@@ -153,6 +171,12 @@ namespace nnet {
         const typename CONFIG_T::controller_metric_t dtheta_sq,
         const typename CONFIG_T::controller_metric_t dgrad_sq,
         typename CONFIG_T::alpha_t alpha[1],
+        typename CONFIG_T::controller_metric_t controller_dtheta_sq[1],
+        typename CONFIG_T::controller_metric_t controller_dgrad_sq[1],
+        typename CONFIG_T::controller_metric_t controller_lhs_sq[1],
+        typename CONFIG_T::controller_metric_t controller_rhs_sq[1],
+        typename CONFIG_T::controller_metric_t controller_alpha_feasible[1],
+        typename CONFIG_T::controller_metric_t controller_alpha_state[1],
         bool reset_numerator
     ) {
 
@@ -160,6 +184,10 @@ namespace nnet {
 
         if (reset_numerator) {
             alpha[0] = typename CONFIG_T::alpha_t(1);
+            reset_controller_metrics<CONFIG_T>(
+                controller_dtheta_sq, controller_dgrad_sq, controller_lhs_sq,
+                controller_rhs_sq, controller_alpha_feasible, controller_alpha_state
+            );
             HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_alpha_name, alpha, 1);
             return;
         }
@@ -188,21 +216,30 @@ namespace nnet {
         };
         static const unsigned n_candidates = 11;
 
-        alpha[0] = typename CONFIG_T::alpha_t(CONFIG_T::controller_alpha_min);
+        metric_t alpha_feasible = metric_t(CONFIG_T::controller_alpha_min);
 
         for (unsigned i = 0; i < n_candidates; i++) {
             #pragma HLS UNROLL
             metric_t lhs = cand_sq[i] * lhs_base;
             if (lhs <= rhs) {
-                alpha[0] = typename CONFIG_T::alpha_t(cand_val[i]);
+                alpha_feasible = cand_val[i];
                 break;
             }
         }
+
+        alpha[0] = typename CONFIG_T::alpha_t(alpha_feasible);
+        controller_dtheta_sq[0] = dtheta_sq;
+        controller_dgrad_sq[0] = dgrad_sq;
+        controller_lhs_sq[0] = lhs_base;
+        controller_rhs_sq[0] = rhs;
+        controller_alpha_feasible[0] = alpha_feasible;
+        controller_alpha_state[0] = alpha_feasible;
 
         HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_dgrad_sq_name, &dgrad_sq, 1);
         HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_dtheta_sq_name, &dtheta_sq, 1);
         HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_lhs_sq_name, &lhs_base, 1);
         HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_rhs_sq_name, &rhs, 1);
+        HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_alpha_feasible_name, &alpha_feasible, 1);
         HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_alpha_name, alpha, 1);
 
     } // global_throttle_order0_law
@@ -224,6 +261,12 @@ namespace nnet {
         const typename CONFIG_T::controller_metric_t dtheta_sq,
         const typename CONFIG_T::controller_metric_t dgrad_sq,
         typename CONFIG_T::alpha_t alpha[1],
+        typename CONFIG_T::controller_metric_t controller_dtheta_sq[1],
+        typename CONFIG_T::controller_metric_t controller_dgrad_sq[1],
+        typename CONFIG_T::controller_metric_t controller_lhs_sq[1],
+        typename CONFIG_T::controller_metric_t controller_rhs_sq[1],
+        typename CONFIG_T::controller_metric_t controller_alpha_feasible[1],
+        typename CONFIG_T::controller_metric_t controller_alpha_state[1],
         bool reset_numerator
     ) {
 
@@ -233,6 +276,10 @@ namespace nnet {
         if (reset_numerator) {
             alpha_state = metric_t(1);
             alpha[0] = typename CONFIG_T::alpha_t(1);
+            reset_controller_metrics<CONFIG_T>(
+                controller_dtheta_sq, controller_dgrad_sq, controller_lhs_sq,
+                controller_rhs_sq, controller_alpha_feasible, controller_alpha_state
+            );
             HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_alpha_name, alpha, 1);
             return;
         }
@@ -286,6 +333,12 @@ namespace nnet {
         }
 
         alpha[0] = typename CONFIG_T::alpha_t(alpha_state);
+        controller_dtheta_sq[0] = dtheta_sq;
+        controller_dgrad_sq[0] = dgrad_sq;
+        controller_lhs_sq[0] = lhs_base;
+        controller_rhs_sq[0] = rhs;
+        controller_alpha_feasible[0] = alpha_feasible;
+        controller_alpha_state[0] = alpha_state;
 
         HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_dgrad_sq_name, &dgrad_sq, 1);
         HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_dtheta_sq_name, &dtheta_sq, 1);

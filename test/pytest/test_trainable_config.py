@@ -561,6 +561,8 @@ def test_vivado_writer_emits_trainable_configs_and_copies_headers(tmp_path):
     assert 'typedef dense_loss_t loss_t;' in trainable_configs
     assert 'typedef dense_alpha_t learning_rate_t;' in trainable_configs
     assert any(port['name'] == 'dense_truth' for port in writer._make_trainable_top_level_ports(model))
+    assert any(port['name'] == 'controller_dtheta_sq' for port in writer._make_trainable_top_level_ports(model))
+    assert any(port['name'] == 'controller_alpha_state' for port in writer._make_trainable_top_level_ports(model))
     assert 'nnet::half_mse<trainable_loss_config0>' in writer._make_trainable_call_chain(model)
     assert 'nnet::dense_backpass<trainable_config' in writer._make_trainable_call_chain(model)
     assert 'nnet::sgd<trainable_config' in writer._make_trainable_call_chain(model)
@@ -578,6 +580,8 @@ def test_vivado_writer_emits_trainable_configs_and_copies_headers(tmp_path):
         in internal_buffers
     )
     assert 'bool train_enable = false;' in writer._make_trainable_bridge_defaults(model, '    ')
+    assert 'controller_dtheta_sq[1];' in writer._make_trainable_testbench_data(model, '', 'e')
+    assert 'controller_dtheta_sq[0] = 0;' in writer._make_trainable_bridge_defaults(model, '')
 
     (tmp_path / 'firmware').mkdir()
     writer.write_trainable_utils(model)

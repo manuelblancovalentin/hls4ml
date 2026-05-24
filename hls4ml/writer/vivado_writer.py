@@ -285,6 +285,15 @@ struct {config_name} {{
                     'direction': 'output',
                 }
             )
+            for metric_name in self._trainable_controller_metric_names():
+                ports.append(
+                    {
+                        'type': self._trainable_type_name(first_layer, 'controller_metric_t'),
+                        'name': metric_name,
+                        'size': 1,
+                        'direction': 'output',
+                    }
+                )
 
             learning_rate_input = self._trainable_learning_rate_input_name(model)
             if learning_rate_input is not None:
@@ -320,6 +329,31 @@ struct {config_name} {{
     @staticmethod
     def _port_call_name(port):
         return port['name']
+
+    @staticmethod
+    def _trainable_controller_metric_names():
+        return (
+            'controller_dtheta_sq',
+            'controller_dgrad_sq',
+            'controller_lhs_sq',
+            'controller_rhs_sq',
+            'controller_alpha_feasible',
+            'controller_alpha_state',
+        )
+
+    def _make_trainable_controller_metric_declarations(self, model, indent):
+        if not getattr(model, 'trainable_backward_order', ()):
+            return ''
+
+        first_layer = model.graph[model.trainable_backward_order[0]]
+        metric_type = self._trainable_type_name(first_layer, 'controller_metric_t')
+        return ''.join(indent + f'{metric_type} {name}[1];\n' for name in self._trainable_controller_metric_names())
+
+    def _make_trainable_controller_metric_reset(self, indent):
+        return ''.join(indent + f'{name}[0] = 0;\n' for name in self._trainable_controller_metric_names())
+
+    def _make_trainable_controller_metric_args(self):
+        return ', '.join(self._trainable_controller_metric_names())
 
     def _make_trainable_top_level_call_args(self, model):
         return [self._port_call_name(port) for port in self._make_trainable_top_level_ports(model)]
@@ -365,6 +399,8 @@ struct {config_name} {{
         if getattr(model, 'trainable_backward_order', ()):
             first_layer = model.graph[model.trainable_backward_order[0]]
             lines.append(indent + f'{self._trainable_type_name(first_layer, "alpha_t")} trainable_alpha[1];\n')
+            lines.append(self._make_trainable_controller_metric_declarations(model, indent))
+            lines.append(self._make_trainable_controller_metric_reset(indent))
 
             learning_rate_input = self._trainable_learning_rate_input_name(model)
             if learning_rate_input is not None:
@@ -415,6 +451,8 @@ struct {config_name} {{
         if getattr(model, 'trainable_backward_order', ()):
             first_layer = model.graph[model.trainable_backward_order[0]]
             lines.append(indent + f'{self._trainable_type_name(first_layer, "alpha_t")} trainable_alpha[1];\n')
+            lines.append(self._make_trainable_controller_metric_declarations(model, indent))
+            lines.append(self._make_trainable_controller_metric_reset(indent))
 
             learning_rate_input = self._trainable_learning_rate_input_name(model)
             if learning_rate_input is not None:
@@ -731,11 +769,14 @@ int main(int argc, char **argv) {{
     std::ofstream fout(RESULTS_LOG);
     std::ofstream floss("tb_data/training/loss.dat");
     std::ofstream falpha("tb_data/training/alpha.dat");
+    std::ofstream fcontroller("tb_data/training/controller.dat");
 {parameter_trace_streams}
     write_trainable_metadata(floss, "loss", run_datetime);
     floss << "epoch,sample,global_step,sample_index,loss" << std::endl;
     write_trainable_metadata(falpha, "alpha", run_datetime);
     falpha << "epoch,sample,global_step,sample_index,alpha" << std::endl;
+    write_trainable_metadata(fcontroller, "controller", run_datetime);
+    fcontroller << "epoch,sample,global_step,sample_index,dtheta_sq,dgrad_sq,lhs_sq,rhs_sq,alpha_feasible,alpha_state" << std::endl;
 {parameter_trace_headers}
 
     std::cout << "============================================================" << std::endl;
@@ -787,6 +828,13 @@ int main(int argc, char **argv) {{
                       << sample_index << "," << step_loss << std::endl;
                 falpha << (epoch + 1) << "," << (sample_step + 1) << "," << global_step << ","
                        << sample_index << "," << (double)trainable_alpha[0] << std::endl;
+                fcontroller << (epoch + 1) << "," << (sample_step + 1) << "," << global_step << ","
+                            << sample_index << "," << (double)controller_dtheta_sq[0]
+                            << "," << (double)controller_dgrad_sq[0]
+                            << "," << (double)controller_lhs_sq[0]
+                            << "," << (double)controller_rhs_sq[0]
+                            << "," << (double)controller_alpha_feasible[0]
+                            << "," << (double)controller_alpha_state[0] << std::endl;
 
                 if (global_step % TRAINABLE_LOG_EVERY == 0) {{
                     std::cout << "Epoch [" << (epoch + 1) << "/" << TRAINABLE_NUM_EPOCHS
@@ -817,10 +865,12 @@ int main(int argc, char **argv) {{
     fout.close();
     floss.close();
     falpha.close();
+    fcontroller.close();
 {parameter_trace_closes}
     std::cout << "INFO: Saved trainable inference results to file: " << RESULTS_LOG << std::endl;
     std::cout << "INFO: Saved trainable loss trace to file: tb_data/training/loss.dat" << std::endl;
     std::cout << "INFO: Saved trainable alpha trace to file: tb_data/training/alpha.dat" << std::endl;
+    std::cout << "INFO: Saved trainable controller trace to file: tb_data/training/controller.dat" << std::endl;
 {parameter_trace_logs}
 
     return 0;
@@ -862,6 +912,8 @@ int main(int argc, char **argv) {{
         if getattr(model, 'trainable_backward_order', ()):
             first_layer = model.graph[model.trainable_backward_order[0]]
             lines.append(indent + f'{self._trainable_type_name(first_layer, "alpha_t")} trainable_alpha[1];\n')
+            lines.append(self._make_trainable_controller_metric_declarations(model, indent))
+            lines.append(self._make_trainable_controller_metric_reset(indent))
 
             learning_rate_input = self._trainable_learning_rate_input_name(model)
             if learning_rate_input is not None:
@@ -958,15 +1010,21 @@ int main(int argc, char **argv) {{
             if controller_kind == 'ctrl_gt_order_0':
                 lines.append(
                     f'            nnet::global_throttle_order0_law<{config_name}>('
-                    'global_dtheta_sq, global_dgrad_sq, trainable_alpha, reset_accumulators);\n'
+                    'global_dtheta_sq, global_dgrad_sq, trainable_alpha, '
+                    f'{self._make_trainable_controller_metric_args()}, reset_accumulators);\n'
                 )
             elif controller_kind == 'ctrl_gt_order_1':
                 lines.append(
                     f'            nnet::global_throttle_order1_law<{config_name}>('
-                    'global_dtheta_sq, global_dgrad_sq, trainable_alpha, reset_accumulators);\n'
+                    'global_dtheta_sq, global_dgrad_sq, trainable_alpha, '
+                    f'{self._make_trainable_controller_metric_args()}, reset_accumulators);\n'
                 )
             else:
                 lines.append(f'            nnet::global_throttle_none<{config_name}>(trainable_alpha);\n')
+                lines.append(
+                    f'            nnet::reset_controller_metrics<{config_name}>('
+                    f'{self._make_trainable_controller_metric_args()});\n'
+                )
 
             # -----------------------------------------------------------------
             #  Phase 3 — SGD proposal + alpha-scaled apply (per layer).
