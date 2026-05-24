@@ -150,10 +150,10 @@ struct {config_name} {{
     static constexpr const char *trace_dgrad_norm_name = "{self._trainable_trace_name(layer.name, 'dgrad_norm')}";
     static constexpr const char *trace_alpha_state_name = "{self._trainable_trace_name(layer.name, 'alpha_state')}";
     static constexpr const char *trace_alpha_feasible_name = "{self._trainable_trace_name(layer.name, 'alpha_feasible')}";
-    static constexpr const char *trace_dgrad_sq_name = "{self._trainable_trace_name(layer.name, 'dgrad_sq')}";
-    static constexpr const char *trace_dtheta_sq_name = "{self._trainable_trace_name(layer.name, 'dtheta_sq')}";
-    static constexpr const char *trace_lhs_sq_name = "{self._trainable_trace_name(layer.name, 'lhs_sq')}";
-    static constexpr const char *trace_rhs_sq_name = "{self._trainable_trace_name(layer.name, 'rhs_sq')}";
+    static constexpr const char *trace_dgrad_norm_sq_name = "{self._trainable_trace_name(layer.name, 'dgrad_norm_sq')}";
+    static constexpr const char *trace_raw_update_norm_sq_name = "{self._trainable_trace_name(layer.name, 'raw_update_norm_sq')}";
+    static constexpr const char *trace_stability_lhs_raw_name = "{self._trainable_trace_name(layer.name, 'stability_lhs_raw')}";
+    static constexpr const char *trace_stability_rhs_name = "{self._trainable_trace_name(layer.name, 'stability_rhs')}";
     static constexpr const char *trace_weights_after_update_name = "{self._trainable_trace_name(layer.name, 'weights_after_update')}";
     static constexpr const char *trace_biases_after_update_name = "{self._trainable_trace_name(layer.name, 'biases_after_update')}";
 #endif
@@ -333,12 +333,19 @@ struct {config_name} {{
     @staticmethod
     def _trainable_controller_metric_names():
         return (
-            'controller_dtheta_sq',
-            'controller_dgrad_sq',
-            'controller_lhs_sq',
-            'controller_rhs_sq',
+            'controller_raw_update_norm_sq',
+            'controller_controlled_update_norm_sq',
+            'controller_actual_update_norm_sq',
+            'controller_dgrad_norm_sq',
+            'controller_dtheta_for_control_sq',
+            'controller_stability_lhs_raw',
+            'controller_stability_lhs_ctrl',
+            'controller_stability_rhs',
             'controller_alpha_feasible',
             'controller_alpha_state',
+            'controller_alpha_code',
+            'controller_alpha_min',
+            'controller_feasible',
         )
 
     def _make_trainable_controller_metric_declarations(self, model, indent):
@@ -776,7 +783,7 @@ int main(int argc, char **argv) {{
     write_trainable_metadata(falpha, "alpha", run_datetime);
     falpha << "epoch,sample,global_step,sample_index,alpha" << std::endl;
     write_trainable_metadata(fcontroller, "controller", run_datetime);
-    fcontroller << "epoch,sample,global_step,sample_index,dtheta_sq,dgrad_sq,lhs_sq,rhs_sq,alpha_feasible,alpha_state" << std::endl;
+    fcontroller << "epoch,sample,global_step,sample_index,raw_update_norm_sq,controlled_update_norm_sq,actual_update_norm_sq,dgrad_norm_sq,dtheta_for_control_sq,stability_lhs_raw,stability_lhs_ctrl,stability_rhs,alpha_feasible,alpha_state,alpha_code,alpha_min,controller_feasible" << std::endl;
 {parameter_trace_headers}
 
     std::cout << "============================================================" << std::endl;
@@ -828,13 +835,22 @@ int main(int argc, char **argv) {{
                       << sample_index << "," << step_loss << std::endl;
                 falpha << (epoch + 1) << "," << (sample_step + 1) << "," << global_step << ","
                        << sample_index << "," << (double)trainable_alpha[0] << std::endl;
-                fcontroller << (epoch + 1) << "," << (sample_step + 1) << "," << global_step << ","
-                            << sample_index << "," << (double)controller_dtheta_sq[0]
-                            << "," << (double)controller_dgrad_sq[0]
-                            << "," << (double)controller_lhs_sq[0]
-                            << "," << (double)controller_rhs_sq[0]
-                            << "," << (double)controller_alpha_feasible[0]
-                            << "," << (double)controller_alpha_state[0] << std::endl;
+                if (batch_end) {{
+                    fcontroller << (epoch + 1) << "," << (sample_step + 1) << "," << global_step << ","
+                                << sample_index << "," << (double)controller_raw_update_norm_sq[0]
+                                << "," << (double)controller_controlled_update_norm_sq[0]
+                                << "," << (double)controller_actual_update_norm_sq[0]
+                                << "," << (double)controller_dgrad_norm_sq[0]
+                                << "," << (double)controller_dtheta_for_control_sq[0]
+                                << "," << (double)controller_stability_lhs_raw[0]
+                                << "," << (double)controller_stability_lhs_ctrl[0]
+                                << "," << (double)controller_stability_rhs[0]
+                                << "," << (double)controller_alpha_feasible[0]
+                                << "," << (double)controller_alpha_state[0]
+                                << "," << (double)controller_alpha_code[0]
+                                << "," << (double)controller_alpha_min[0]
+                                << "," << (double)controller_feasible[0] << std::endl;
+                }}
 
                 if (global_step % TRAINABLE_LOG_EVERY == 0) {{
                     std::cout << "Epoch [" << (epoch + 1) << "/" << TRAINABLE_NUM_EPOCHS
@@ -980,27 +996,42 @@ int main(int argc, char **argv) {{
             lines.append('        if (batch_end) {\n')
 
             # -----------------------------------------------------------------
-            #  Phase 1 — Per-layer curvature accumulation (only when the
-            #  controller needs curvature sensing).
+            #  Phase 1 — SGD proposal + raw-update controller sensing.
+            #  SGD emits Δθ_raw = -learning_rate * gradient, so the raw update
+            #  norm already includes eta. The controller law must not multiply
+            #  raw_update_norm_sq by eta again.
             # -----------------------------------------------------------------
             if needs_curvature:
-                lines.append(f'            {config_name}::controller_metric_t global_dtheta_sq = 0;\n')
-                lines.append(f'            {config_name}::controller_metric_t global_dgrad_sq = 0;\n')
+                lines.append(f'            {config_name}::controller_metric_t global_raw_update_norm_sq = 0;\n')
+                lines.append(f'            {config_name}::controller_metric_t global_dgrad_norm_sq = 0;\n')
 
-                for layer_name in backward_order:
-                    layer = model.graph[layer_name]
-                    if layer.class_name != 'Dense':
-                        continue
-                    prefix = layer.name
-                    layer_config = self._trainable_dense_config_name(layer)
+            for layer_name in backward_order:
+                layer = model.graph[layer_name]
+                if layer.class_name != 'Dense':
+                    continue
+                prefix = layer.name
+                layer_config = self._trainable_dense_config_name(layer)
+                lines.append(
+                    '            nnet::sgd<{config}>({weight_grad}, {bias_grad}, '
+                    '{weight_update}, {bias_update}, {learning_rate});\n'.format(
+                        config=layer_config,
+                        weight_grad=f'{prefix}_weight_grad',
+                        bias_grad=f'{prefix}_bias_grad',
+                        weight_update=f'{prefix}_weight_update',
+                        bias_update=f'{prefix}_bias_update',
+                        learning_rate=self._trainable_learning_rate_expr(model, layer),
+                    )
+                )
+                if needs_curvature:
                     lines.append(
                         '            {\n'
-                        f'                {layer_config}::controller_metric_t __dt, __dg;\n'
-                        f'                nnet::curvature_sensor_order0<{layer_config}>('
-                        f'{layer.get_weights("weight").name}, {layer.get_weights("bias").name}, '
-                        f'{prefix}_weight_grad, {prefix}_bias_grad, __dt, __dg, reset_accumulators);\n'
-                        '                global_dtheta_sq += __dt;\n'
-                        '                global_dgrad_sq += __dg;\n'
+                        f'                {layer_config}::controller_metric_t __raw_update_norm_sq, __dgrad_norm_sq;\n'
+                        f'                nnet::raw_update_sensor_order0<{layer_config}>('
+                        f'{prefix}_weight_update, {prefix}_bias_update, '
+                        f'{prefix}_weight_grad, {prefix}_bias_grad, '
+                        f'__raw_update_norm_sq, __dgrad_norm_sq, reset_accumulators);\n'
+                        '                global_raw_update_norm_sq += __raw_update_norm_sq;\n'
+                        '                global_dgrad_norm_sq += __dgrad_norm_sq;\n'
                         '            }\n'
                     )
 
@@ -1010,13 +1041,13 @@ int main(int argc, char **argv) {{
             if controller_kind == 'ctrl_gt_order_0':
                 lines.append(
                     f'            nnet::global_throttle_order0_law<{config_name}>('
-                    'global_dtheta_sq, global_dgrad_sq, trainable_alpha, '
+                    'global_raw_update_norm_sq, global_dgrad_norm_sq, trainable_alpha, '
                     f'{self._make_trainable_controller_metric_args()}, reset_accumulators);\n'
                 )
             elif controller_kind == 'ctrl_gt_order_1':
                 lines.append(
                     f'            nnet::global_throttle_order1_law<{config_name}>('
-                    'global_dtheta_sq, global_dgrad_sq, trainable_alpha, '
+                    'global_raw_update_norm_sq, global_dgrad_norm_sq, trainable_alpha, '
                     f'{self._make_trainable_controller_metric_args()}, reset_accumulators);\n'
                 )
             else:
@@ -1027,34 +1058,25 @@ int main(int argc, char **argv) {{
                 )
 
             # -----------------------------------------------------------------
-            #  Phase 3 — SGD proposal + alpha-scaled apply (per layer).
+            #  Phase 3 — Alpha-scaled apply (per layer).
             # -----------------------------------------------------------------
+            lines.append(f'            {config_name}::controller_metric_t global_actual_update_norm_sq = 0;\n')
             for layer_name in backward_order:
                 layer = model.graph[layer_name]
                 if layer.class_name != 'Dense':
                     continue
                 prefix = layer.name
+                layer_config = self._trainable_dense_config_name(layer)
                 lines.append(
-                    '            nnet::sgd<{config}>({weight_grad}, {bias_grad}, '
-                    '{weight_update}, {bias_update}, {learning_rate});\n'.format(
-                        config=self._trainable_dense_config_name(layer),
-                        weight_grad=f'{prefix}_weight_grad',
-                        bias_grad=f'{prefix}_bias_grad',
-                        weight_update=f'{prefix}_weight_update',
-                        bias_update=f'{prefix}_bias_update',
-                        learning_rate=self._trainable_learning_rate_expr(model, layer),
-                    )
+                    '            {\n'
+                    f'                {layer_config}::controller_metric_t __actual_update_norm_sq;\n'
+                    f'                nnet::apply_dense_update<{layer_config}>('
+                    f'{layer.get_weights("weight").name}, {layer.get_weights("bias").name}, '
+                    f'{prefix}_weight_update, {prefix}_bias_update, trainable_alpha, __actual_update_norm_sq);\n'
+                    '                global_actual_update_norm_sq += __actual_update_norm_sq;\n'
+                    '            }\n'
                 )
-                lines.append(
-                    '            nnet::apply_dense_update<{config}>({weights}, {biases}, '
-                    '{weight_update}, {bias_update}, trainable_alpha);\n'.format(
-                        config=self._trainable_dense_config_name(layer),
-                        weights=layer.get_weights('weight').name,
-                        biases=layer.get_weights('bias').name,
-                        weight_update=f'{prefix}_weight_update',
-                        bias_update=f'{prefix}_bias_update',
-                    )
-                )
+            lines.append('            controller_actual_update_norm_sq[0] = global_actual_update_norm_sq;\n')
             lines.append('        }\n')
 
         lines.append('    }\n\n')
