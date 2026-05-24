@@ -3,8 +3,6 @@
 
 #include "../common/trainable_trace.h"
 
-#include <cmath>
-
 namespace nnet {
 
     // -------------------------------------------------------------------------
