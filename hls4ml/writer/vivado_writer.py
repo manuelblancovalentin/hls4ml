@@ -105,11 +105,13 @@ struct {config_name} {{
         controller_epsilon = controller_config.get('Epsilon', 1e-12)
         controller_alpha_min = controller_config.get('AlphaMin', 0.0)
         controller_alpha_max = controller_config.get('AlphaMax', 1.0)
+        controller_k_alpha = controller_config.get('KAlpha', 0.1)
         controller_params_decl = (
             f'    static constexpr double controller_chi = {controller_chi};\n'
             f'    static constexpr double controller_epsilon = {controller_epsilon};\n'
             f'    static constexpr double controller_alpha_min = {controller_alpha_min};\n'
             f'    static constexpr double controller_alpha_max = {controller_alpha_max};\n'
+            f'    static constexpr double controller_k_alpha = {controller_k_alpha};\n'
         )
 
         return f"""// Trainable Dense state for {layer.name}
@@ -143,6 +145,10 @@ struct {config_name} {{
     static constexpr const char *trace_weight_update_name = "{self._trainable_trace_name(layer.name, 'weight_update')}";
     static constexpr const char *trace_bias_update_name = "{self._trainable_trace_name(layer.name, 'bias_update')}";
     static constexpr const char *trace_alpha_name = "{self._trainable_trace_name(layer.name, 'alpha')}";
+    static constexpr const char *trace_curvature_name = "{self._trainable_trace_name(layer.name, 'curvature')}";
+    static constexpr const char *trace_dtheta_norm_name = "{self._trainable_trace_name(layer.name, 'dtheta_norm')}";
+    static constexpr const char *trace_dgrad_norm_name = "{self._trainable_trace_name(layer.name, 'dgrad_norm')}";
+    static constexpr const char *trace_alpha_state_name = "{self._trainable_trace_name(layer.name, 'alpha_state')}";
     static constexpr const char *trace_weights_after_update_name = "{self._trainable_trace_name(layer.name, 'weights_after_update')}";
     static constexpr const char *trace_biases_after_update_name = "{self._trainable_trace_name(layer.name, 'biases_after_update')}";
 #endif
@@ -871,6 +877,7 @@ int main(int argc, char **argv) {{
             return ''
 
         controller_kind = self._normalize_trainable_choice(model.config.get_controller_config().get('Kind', 'none'))
+        needs_curvature = controller_kind in ('ctrl_gt_order_0', 'ctrl_gt_order_1')
 
         lines = ['    // Trainable loss, backprop, optimizer, and update path\n', '    if (train_enable) {\n']
 
@@ -910,67 +917,74 @@ int main(int argc, char **argv) {{
             )
 
         if backward_order:
+            first_layer = model.graph[backward_order[0]]
+            config_name = self._trainable_dense_config_name(first_layer)
+
             lines.append('        if (batch_end) {\n')
 
+            # -----------------------------------------------------------------
+            #  Phase 1 — Per-layer curvature accumulation (only when the
+            #  controller needs curvature sensing).
+            # -----------------------------------------------------------------
+            if needs_curvature:
+                lines.append(f'            {config_name}::controller_metric_t global_dtheta_sq = 0;\n')
+                lines.append(f'            {config_name}::controller_metric_t global_dgrad_sq = 0;\n')
+
+                for layer_name in backward_order:
+                    layer = model.graph[layer_name]
+                    if layer.class_name != 'Dense':
+                        continue
+                    prefix = layer.name
+                    layer_config = self._trainable_dense_config_name(layer)
+                    lines.append(
+                        '            {\n'
+                        f'                {layer_config}::controller_metric_t __dt, __dg;\n'
+                        f'                nnet::curvature_sensor_order0<{layer_config}>('
+                        f'{layer.get_weights("weight").name}, {layer.get_weights("bias").name}, '
+                        f'{prefix}_weight_grad, {prefix}_bias_grad, __dt, __dg, reset_accumulators);\n'
+                        '                global_dtheta_sq += __dt;\n'
+                        '                global_dgrad_sq += __dg;\n'
+                        '            }\n'
+                    )
+
+            # -----------------------------------------------------------------
+            #  Phase 2 — Controller law (global, once).
+            # -----------------------------------------------------------------
             if controller_kind == 'ctrl_gt_order_0':
-                # GT-0: compute curvature and safe alpha from raw accumulated
-                # gradients, THEN produce the SGD raw-direction proposal.
-                first_layer = model.graph[backward_order[0]]
-                first_prefix = backward_order[0]
                 lines.append(
-                    '            nnet::global_throttle_order0<{config}>({weights}, {biases}, {weight_grad}, {bias_grad}, trainable_alpha, reset_accumulators);\n'.format(
-                        config=self._trainable_dense_config_name(first_layer),
-                        weights=first_layer.get_weights('weight').name,
-                        biases=first_layer.get_weights('bias').name,
-                        weight_grad=f'{first_prefix}_weight_grad',
-                        bias_grad=f'{first_prefix}_bias_grad',
-                    )
+                    f'            nnet::global_throttle_order0_law<{config_name}>('
+                    'global_dtheta_sq, global_dgrad_sq, trainable_alpha, reset_accumulators);\n'
                 )
-                for layer_name in backward_order:
-                    layer = model.graph[layer_name]
-                    if layer.class_name != 'Dense':
-                        continue
-                    prefix = layer.name
-                    lines.append(
-                        '            nnet::sgd<{config}>({weight_grad}, {bias_grad}, {weight_update}, {bias_update}, {learning_rate});\n'.format(
-                            config=self._trainable_dense_config_name(layer),
-                            weight_grad=f'{prefix}_weight_grad',
-                            bias_grad=f'{prefix}_bias_grad',
-                            weight_update=f'{prefix}_weight_update',
-                            bias_update=f'{prefix}_bias_update',
-                            learning_rate=self._trainable_learning_rate_expr(model, layer),
-                        )
-                    )
-
+            elif controller_kind == 'ctrl_gt_order_1':
+                lines.append(
+                    f'            nnet::global_throttle_order1_law<{config_name}>('
+                    'global_dtheta_sq, global_dgrad_sq, trainable_alpha, reset_accumulators);\n'
+                )
             else:
-                # CTRL-NONE (and any future controller without curvature sensing):
-                # SGD first, then identity controller (alpha=1), then apply.
-                for layer_name in backward_order:
-                    layer = model.graph[layer_name]
-                    if layer.class_name != 'Dense':
-                        continue
-                    prefix = layer.name
-                    lines.append(
-                        '            nnet::sgd<{config}>({weight_grad}, {bias_grad}, {weight_update}, {bias_update}, {learning_rate});\n'.format(
-                            config=self._trainable_dense_config_name(layer),
-                            weight_grad=f'{prefix}_weight_grad',
-                            bias_grad=f'{prefix}_bias_grad',
-                            weight_update=f'{prefix}_weight_update',
-                            bias_update=f'{prefix}_bias_update',
-                            learning_rate=self._trainable_learning_rate_expr(model, layer),
-                        )
-                    )
+                lines.append(f'            nnet::global_throttle_none<{config_name}>(trainable_alpha);\n')
 
-                first_layer = model.graph[backward_order[0]]
-                lines.append(f'            nnet::global_throttle_none<{self._trainable_dense_config_name(first_layer)}>(trainable_alpha);\n')
-
+            # -----------------------------------------------------------------
+            #  Phase 3 — SGD proposal + alpha-scaled apply (per layer).
+            # -----------------------------------------------------------------
             for layer_name in backward_order:
                 layer = model.graph[layer_name]
                 if layer.class_name != 'Dense':
                     continue
                 prefix = layer.name
                 lines.append(
-                    '            nnet::apply_dense_update<{config}>({weights}, {biases}, {weight_update}, {bias_update}, trainable_alpha);\n'.format(
+                    '            nnet::sgd<{config}>({weight_grad}, {bias_grad}, '
+                    '{weight_update}, {bias_update}, {learning_rate});\n'.format(
+                        config=self._trainable_dense_config_name(layer),
+                        weight_grad=f'{prefix}_weight_grad',
+                        bias_grad=f'{prefix}_bias_grad',
+                        weight_update=f'{prefix}_weight_update',
+                        bias_update=f'{prefix}_bias_update',
+                        learning_rate=self._trainable_learning_rate_expr(model, layer),
+                    )
+                )
+                lines.append(
+                    '            nnet::apply_dense_update<{config}>({weights}, {biases}, '
+                    '{weight_update}, {bias_update}, trainable_alpha);\n'.format(
                         config=self._trainable_dense_config_name(layer),
                         weights=layer.get_weights('weight').name,
                         biases=layer.get_weights('bias').name,
