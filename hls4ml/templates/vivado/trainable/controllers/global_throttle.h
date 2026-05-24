@@ -297,10 +297,6 @@ namespace nnet {
 
     } // global_throttle_order1_law
 
-        HLS4ML_TRAINABLE_TRACE_ARRAY(CONFIG_T::trace_alpha_name, alpha, 1);
-
-    } // global_throttle_order1_law
-
 
     // -------------------------------------------------------------------------
     //  Phase 3  —  Apply one alpha-scaled update to a Dense layer
